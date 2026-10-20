@@ -333,9 +333,9 @@ pub struct Niri {
     pub suppressed_keys: HashSet<Keycode>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
-    /// Title bar button pressed with the left mouse button, and whether Alt was held; it acts
-    /// on release over it.
-    pub titlebar_press: Option<(Window, TitlebarPart, bool)>,
+    /// Title bar button pressed with the left mouse button, whether Alt was held, and the
+    /// pointer location at the press; it acts on release over it, or where it was pressed.
+    pub titlebar_press: Option<(Window, TitlebarPart, bool, Point<f64, Logical>)>,
     /// The view targets when a shell menu (a layer surface named titlebar.menu-namespace)
     /// appeared, and whether titlebar.menu-close-command already ran for it: once a view
     /// scrolls, switches workspace or the overview opens or closes, the menu would no longer be

@@ -72,6 +72,9 @@ pub mod touch_resize_grab;
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
+/// How far (logical px) the pointer can move between a title bar button's press and release
+/// and still click it when the button itself moved away (the view scrolled to its window).
+const TITLEBAR_CLICK_SLOP: f64 = 4.;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TabletData {
@@ -2978,13 +2981,19 @@ impl State {
         }
 
         if button_state == ButtonState::Released && button == Some(MouseButton::Left) {
-            if let Some((window, part, alt)) = self.niri.titlebar_press.take() {
-                let under = self.niri.contents_under(pointer.current_location()).window;
+            if let Some((window, part, alt, pressed_at)) = self.niri.titlebar_press.take() {
+                let location = pointer.current_location();
+                let under = self.niri.contents_under(location).window;
                 let still_over = matches!(
                     under,
                     Some((w, HitType::Activate { titlebar: Some(p), .. })) if w == window && p == part
                 );
-                if still_over {
+                // The press activates the window, which can scroll the view to it and move the
+                // button away from under a pointer that stayed put: that is still a click.
+                let delta = location - pressed_at;
+                let stayed = delta.x.abs() <= TITLEBAR_CLICK_SLOP
+                    && delta.y.abs() <= TITLEBAR_CLICK_SLOP;
+                if still_over || stayed {
                     self.titlebar_button_clicked(&window, part, alt);
                 }
             }
@@ -3175,7 +3184,8 @@ impl State {
                         } else {
                             // Buttons act on release over the same button.
                             let alt = modifiers_from_state(mods).contains(Modifiers::ALT);
-                            self.niri.titlebar_press = Some((window.clone(), part, alt));
+                            self.niri.titlebar_press =
+                                Some((window.clone(), part, alt, pointer.current_location()));
                         }
                     } else if is_overview_open || mod_down {
                         let location = pointer.current_location();
