@@ -99,6 +99,7 @@ impl CompositorHandler for State {
                         output,
                         workspace_id,
                         is_pending_maximized,
+                        maximized_by_layout,
                     ) = if let InitialConfigureState::Configured {
                         rules,
                         width,
@@ -109,6 +110,7 @@ impl CompositorHandler for State {
                         output,
                         workspace_name,
                         is_pending_maximized,
+                        maximized_by_layout,
                     } = state
                     {
                         // Check that the output is still connected.
@@ -129,6 +131,7 @@ impl CompositorHandler for State {
                             output,
                             workspace_id,
                             is_pending_maximized,
+                            maximized_by_layout,
                         )
                     } else {
                         // Can happen when a surface unmaps by attaching a null buffer while
@@ -141,6 +144,7 @@ impl CompositorHandler for State {
                             false,
                             None,
                             None,
+                            false,
                             false,
                         )
                     };
@@ -192,6 +196,10 @@ impl CompositorHandler for State {
                         })
                         .map(|(mapped, _)| mapped.window.clone());
 
+                    // A window reopened at login goes straight back where it was.
+                    let restored =
+                        crate::window_placement::place_mapping_window(self, toplevel, &window);
+
                     // The mapped pre-commit hook deals with dma-bufs on its own.
                     self.remove_default_dmabuf_pre_commit_hook(surface);
                     let hook = add_mapped_toplevel_pre_commit_hook(toplevel);
@@ -201,16 +209,34 @@ impl CompositorHandler for State {
                     };
                     let window = mapped.window.clone();
 
-                    let target = if let Some(p) = &parent {
-                        // Open dialogs next to their parent window.
-                        AddWindowTarget::NextTo(p)
-                    } else if let Some(id) = workspace_id {
-                        AddWindowTarget::Workspace(id)
-                    } else if let Some(output) = &output {
-                        AddWindowTarget::Output(output)
-                    } else {
-                        AddWindowTarget::Auto
+                    let (width, is_full_width, is_floating, activate) = match &restored {
+                        Some(r) => (r.width.or(width), false, r.floating, r.activate),
+                        None => (width, is_full_width, is_floating, activate),
                     };
+
+                    let target =
+                        if let Some(target) = restored.as_ref().and_then(|r| r.target.as_ref()) {
+                            use crate::window_placement::Target;
+                            match target {
+                                Target::Workspace(id) => AddWindowTarget::Workspace(*id),
+                                Target::WorkspaceColumn(id, at) => {
+                                    AddWindowTarget::WorkspaceColumn(*id, *at)
+                                }
+                                Target::InColumn(next_to, at) => {
+                                    AddWindowTarget::InColumn(next_to, *at)
+                                }
+                                Target::Output(output) => AddWindowTarget::Output(output),
+                            }
+                        } else if let Some(p) = &parent {
+                            // Open dialogs next to their parent window.
+                            AddWindowTarget::NextTo(p)
+                        } else if let Some(id) = workspace_id {
+                            AddWindowTarget::Workspace(id)
+                        } else if let Some(output) = &output {
+                            AddWindowTarget::Output(output)
+                        } else {
+                            AddWindowTarget::Auto
+                        };
                     let output = self.niri.layout.add_window(
                         mapped,
                         target,
@@ -227,8 +253,18 @@ impl CompositorHandler for State {
                     // maximized from the is_pending_maximized variable. Tell the layout about it
                     // here so that unfullscreening the window makes it maximized.
                     if let Some((mapped, _)) = self.niri.layout.find_window_and_output(surface) {
-                        if mapped.pending_sizing_mode().is_fullscreen() && is_pending_maximized {
+                        let mode = mapped.pending_sizing_mode();
+                        if let Some(r) = &restored {
+                            if !r.floating && mode.is_maximized() != r.maximized {
+                                self.niri.layout.set_maximized(&window, r.maximized);
+                            }
+                        } else if mode.is_fullscreen() && is_pending_maximized {
                             self.niri.layout.set_maximized(&window, true);
+                        } else if maximized_by_layout && is_floating && mode.is_maximized() {
+                            // Maximized only by the layout default, which leaves floating windows
+                            // alone, but the window turned out floating as it mapped: unmaximize
+                            // it back into floating.
+                            self.niri.layout.set_maximized(&window, false);
                         }
                     } else {
                         error!("layout is missing the window that we just added");

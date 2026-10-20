@@ -28,7 +28,9 @@ use crate::utils::ResizeEdge;
 use crate::window::ResolvedWindowRules;
 
 /// Amount of touchpad movement to scroll the view for the width of one working area.
-const VIEW_GESTURE_WORKING_AREA_MOVEMENT: f64 = 1200.;
+/// Local gesture-only patch: twice as responsive as the stock 1200-unit scale.
+/// Used by both live movement and release projection; no input/app scrolling changes.
+const VIEW_GESTURE_WORKING_AREA_MOVEMENT: f64 = 600.;
 
 /// A scrollable-tiling space for windows.
 #[derive(Debug)]
@@ -107,6 +109,23 @@ niri_render_elements! {
 struct ColumnData {
     /// Cached actual column width.
     width: f64,
+}
+
+/// Where a scrolling space's view is among its columns (0-based); see
+/// [`ScrollingSpace::ipc_view_column`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IpcViewColumn {
+    /// At rest on the active column.
+    Static(usize),
+    /// A gesture holds the view, this far along the columns.
+    Gesture(f64),
+    /// Animating to the active column, `progress` (0 to 1, springs may overshoot) of the way
+    /// from wherever it was when the animation started at `start`.
+    Animation {
+        column: usize,
+        progress: f64,
+        start: Duration,
+    },
 }
 
 #[derive(Debug)]
@@ -421,6 +440,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.columns.is_empty()
     }
 
+    pub fn active_column(&self) -> Option<&Column<W>> {
+        self.columns.get(self.active_column_idx)
+    }
+
     pub fn active_window(&self) -> Option<&W> {
         if self.columns.is_empty() {
             return None;
@@ -514,10 +537,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             0
         };
 
+        // Assume the window will take server-side decorations, as it will if it can.
+        let titlebar = self
+            .options
+            .layout
+            .titlebar
+            .clone()
+            .merged_with(&rules.titlebar);
+        let titlebar_height = if titlebar.off { 0. } else { titlebar.height };
+
         let mut full_height = self.working_area.size.h - self.options.layout.gaps * 2.;
         if !border.off {
             full_height -= border.width * 2.;
         }
+        full_height -= titlebar_height;
 
         let height = if let Some(height) = height {
             let height = match resolve_preset_size(height, &self.options, working_size.h, extra.h) {
@@ -525,7 +558,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                     if !border.off {
                         size -= border.width * 2.;
                     }
-                    size
+                    size - titlebar_height
                 }
                 ResolvedSize::Window(size) => size,
             };
@@ -2295,6 +2328,61 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         self.column_x(self.active_column_idx) + self.view_offset.current()
     }
 
+    /// Where the view is among the columns, for IPC (a bar following column switches); `None`
+    /// without columns.
+    pub fn ipc_view_column(&self) -> Option<IpcViewColumn> {
+        let count = self.columns.len();
+        if count == 0 {
+            return None;
+        }
+        let active = self.active_column_idx;
+        Some(match &self.view_offset {
+            ViewOffset::Static(_) => IpcViewColumn::Static(active),
+            ViewOffset::Animation(anim) => {
+                let span = anim.to() - anim.from();
+                let progress = if span.abs() < 0.5 {
+                    1.
+                } else {
+                    (anim.value() - anim.from()) / span
+                };
+                IpcViewColumn::Animation {
+                    column: active,
+                    progress,
+                    start: anim.start_time(),
+                }
+            }
+            ViewOffset::Gesture(gesture) => {
+                // Walk the view's travel since the gesture began across the columns: moving by
+                // a column's width (and gap) moves one column along.
+                let xs: Vec<f64> = self.column_xs(self.data.iter().copied()).collect();
+                let mut delta = self.view_offset.current() - gesture.stationary_view_offset;
+                let mut pos = active as f64;
+                let mut idx = active;
+                while delta > 0. && idx + 1 < count {
+                    let width = xs[idx + 1] - xs[idx];
+                    if width <= 0. {
+                        break;
+                    }
+                    let step = delta.min(width);
+                    pos += step / width;
+                    delta -= step;
+                    idx += 1;
+                }
+                while delta < 0. && idx > 0 {
+                    let width = xs[idx] - xs[idx - 1];
+                    if width <= 0. {
+                        break;
+                    }
+                    let step = (-delta).min(width);
+                    pos -= step / width;
+                    delta += step;
+                    idx -= 1;
+                }
+                IpcViewColumn::Gesture(pos)
+            }
+        })
+    }
+
     pub fn target_view_pos(&self) -> f64 {
         self.column_x(self.active_column_idx) + self.view_offset.target()
     }
@@ -2985,6 +3073,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 ) {
                     let hit = HitType::Activate {
                         is_tab_indicator: true,
+                        titlebar: None,
                     };
                     return Some((col.tiles[idx].window(), hit));
                 }
@@ -4045,6 +4134,12 @@ impl<W: LayoutElement> Column<W> {
             update_sizes = true;
         }
 
+        if self.options.layout.titlebar.off != options.layout.titlebar.off
+            || self.options.layout.titlebar.height != options.layout.titlebar.height
+        {
+            update_sizes = true;
+        }
+
         for (tile, data) in zip(&mut self.tiles, &mut self.data) {
             tile.update_config(view_size, scale, options.clone());
             data.update(tile);
@@ -4803,8 +4898,17 @@ impl<W: LayoutElement> Column<W> {
         };
 
         let len = self.options.layout.preset_column_widths.len();
+        let no_wrap = self.options.layout.preset_widths_no_wrap;
         let preset_idx = if let Some(idx) = preset_idx {
-            (idx + if forwards { 1 } else { len - 1 }) % len
+            if no_wrap {
+                if forwards {
+                    (idx + 1).min(len - 1)
+                } else {
+                    idx.saturating_sub(1)
+                }
+            } else {
+                (idx + if forwards { 1 } else { len - 1 }) % len
+            }
         } else {
             let tile = &self.tiles[tile_idx];
             let current_window = tile.window_expected_or_current_size().w;
@@ -4825,7 +4929,7 @@ impl<W: LayoutElement> Column<W> {
                         ResolvedSize::Window(resolved) => current_window + 1. < resolved,
                     }
                 })
-                .unwrap_or(0)
+                .unwrap_or(if no_wrap { len - 1 } else { 0 })
             } else {
                 it.rposition(|resolved| {
                     match resolved {
@@ -4834,7 +4938,7 @@ impl<W: LayoutElement> Column<W> {
                         ResolvedSize::Window(resolved) => resolved + 1. < current_window,
                     }
                 })
-                .unwrap_or(len - 1)
+                .unwrap_or(if no_wrap { 0 } else { len - 1 })
             }
         };
 
@@ -5018,9 +5122,18 @@ impl<W: LayoutElement> Column<W> {
         }
 
         let len = self.options.layout.preset_window_heights.len();
+        let no_wrap = self.options.layout.preset_heights_no_wrap;
         let preset_idx = match self.data[tile_idx].height {
             WindowHeight::Preset(idx) if !self.is_pending_maximized => {
-                (idx + if forwards { 1 } else { len - 1 }) % len
+                if no_wrap {
+                    if forwards {
+                        (idx + 1).min(len - 1)
+                    } else {
+                        idx.saturating_sub(1)
+                    }
+                } else {
+                    (idx + if forwards { 1 } else { len - 1 }) % len
+                }
             }
             _ => {
                 let current = self.data[tile_idx].size.h;
@@ -5045,13 +5158,13 @@ impl<W: LayoutElement> Column<W> {
                         // Some allowance for fractional scaling purposes.
                         current + 1. < resolved
                     })
-                    .unwrap_or(0)
+                    .unwrap_or(if no_wrap { len - 1 } else { 0 })
                 } else {
                     it.rposition(|resolved| {
                         // Some allowance for fractional scaling purposes.
                         resolved + 1. < current
                     })
-                    .unwrap_or(len - 1)
+                    .unwrap_or(if no_wrap { 0 } else { len - 1 })
                 }
             }
         };
@@ -5571,6 +5684,41 @@ mod tests {
 
     use super::*;
     use crate::utils::round_logical_in_physical;
+
+    #[test]
+    fn faster_swipe_600_units_spans_one_working_area() {
+        for width in [1280., 1920.] {
+            for is_touchpad in [false, true] {
+                let size = Size::from((width, 720.));
+                let mut space = ScrollingSpace::<crate::window::Mapped>::new(
+                    size,
+                    Rectangle::from_size(size),
+                    1.,
+                    Clock::with_time(Duration::from_millis(10)),
+                    Rc::new(Options::default()),
+                );
+                // Seed the gesture directly so no Wayland client is needed.
+                space.view_offset = ViewOffset::Gesture(ViewGesture {
+                    current_view_offset: 0.,
+                    animation: None,
+                    tracker: SwipeTracker::new(),
+                    delta_from_tracker: 0.,
+                    stationary_view_offset: 0.,
+                    is_touchpad,
+                    dnd_last_event_time: None,
+                    dnd_nonzero_start_time: None,
+                });
+                assert_eq!(
+                    space.view_offset_gesture_update(600., Duration::from_millis(10), is_touchpad),
+                    Some(true)
+                );
+                let expected = if is_touchpad { width } else { 600. };
+                assert!((space.view_offset.current() - expected).abs() < 1e-9);
+                assert!(space.view_offset_gesture_end(Some(is_touchpad)));
+                assert!((space.view_offset.current() - expected).abs() < 1e-9);
+            }
+        }
+    }
 
     #[test]
     fn working_area_starts_at_physical_pixel() {

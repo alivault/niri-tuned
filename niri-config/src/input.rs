@@ -30,17 +30,17 @@ pub struct InputPart {
     #[knuffel(child)]
     pub keyboard: Option<KeyboardPart>,
     #[knuffel(child)]
-    pub touchpad: Option<Touchpad>,
+    pub touchpad: Option<TouchpadPart>,
     #[knuffel(child)]
-    pub mouse: Option<Mouse>,
+    pub mouse: Option<MousePart>,
     #[knuffel(child)]
-    pub trackpoint: Option<Trackpoint>,
+    pub trackpoint: Option<TrackpointPart>,
     #[knuffel(child)]
-    pub trackball: Option<Trackball>,
+    pub trackball: Option<TrackballPart>,
     #[knuffel(child)]
-    pub tablet: Option<Tablet>,
+    pub tablet: Option<TabletPart>,
     #[knuffel(child)]
-    pub touch: Option<Touch>,
+    pub touch: Option<TouchPart>,
     #[knuffel(child)]
     pub disable_power_key_handling: Option<Flag>,
     #[knuffel(child)]
@@ -57,15 +57,13 @@ pub struct InputPart {
 
 impl MergeWith<InputPart> for Input {
     fn merge_with(&mut self, part: &InputPart) {
+        // Pointing devices merge setting by setting, as the keyboard does: an included
+        // file changing `tap` keeps everything else the earlier `touchpad` said.
         merge!(
             (self, part),
             keyboard,
             disable_power_key_handling,
             workspace_auto_back_and_forth,
-        );
-
-        merge_clone!(
-            (self, part),
             touchpad,
             mouse,
             trackpoint,
@@ -377,6 +375,224 @@ pub struct Touch {
     pub calibration_matrix: Option<Vec<f32>>,
     #[knuffel(child, unwrap(argument))]
     pub map_to_output: Option<String>,
+}
+
+// The pointing devices as one config part says them: each setting optional, flags
+// switchable off with `false` (`tap false`), merged into the device setting by setting.
+macro_rules! some {
+    (($self:expr, $part:expr), $($field:ident),+ $(,)*) => {
+        $(
+            if let Some(x) = &$part.$field {
+                $self.$field = Some(x.clone());
+            }
+        )+
+    };
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct TouchpadPart {
+    #[knuffel(child)]
+    pub off: Option<Flag>,
+    #[knuffel(child)]
+    pub tap: Option<Flag>,
+    #[knuffel(child)]
+    pub dwt: Option<Flag>,
+    #[knuffel(child)]
+    pub dwtp: Option<Flag>,
+    #[knuffel(child, unwrap(argument))]
+    pub drag: Option<bool>,
+    #[knuffel(child)]
+    pub drag_lock: Option<Flag>,
+    #[knuffel(child)]
+    pub natural_scroll: Option<Flag>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub click_method: Option<ClickMethod>,
+    #[knuffel(child, unwrap(argument))]
+    pub accel_speed: Option<FloatOrInt<-1, 1>>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub accel_profile: Option<AccelProfile>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub scroll_method: Option<ScrollMethod>,
+    #[knuffel(child, unwrap(argument))]
+    pub scroll_button: Option<u32>,
+    #[knuffel(child)]
+    pub scroll_button_lock: Option<Flag>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub tap_button_map: Option<TapButtonMap>,
+    #[knuffel(child)]
+    pub left_handed: Option<Flag>,
+    #[knuffel(child)]
+    pub disabled_on_external_mouse: Option<Flag>,
+    #[knuffel(child)]
+    pub middle_emulation: Option<Flag>,
+    #[knuffel(child)]
+    pub scroll_factor: Option<ScrollFactor>,
+}
+
+impl MergeWith<TouchpadPart> for Touchpad {
+    fn merge_with(&mut self, part: &TouchpadPart) {
+        merge!(
+            (self, part),
+            off,
+            tap,
+            dwt,
+            dwtp,
+            drag_lock,
+            natural_scroll,
+            scroll_button_lock,
+            left_handed,
+            disabled_on_external_mouse,
+            middle_emulation,
+        );
+        merge_clone!((self, part), accel_speed);
+        merge_clone_opt!((self, part), drag);
+        some!(
+            (self, part),
+            click_method,
+            accel_profile,
+            scroll_method,
+            scroll_button,
+            tap_button_map,
+            scroll_factor,
+        );
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct MousePart {
+    #[knuffel(child)]
+    pub off: Option<Flag>,
+    #[knuffel(child)]
+    pub natural_scroll: Option<Flag>,
+    #[knuffel(child, unwrap(argument))]
+    pub accel_speed: Option<FloatOrInt<-1, 1>>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub accel_profile: Option<AccelProfile>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub scroll_method: Option<ScrollMethod>,
+    #[knuffel(child, unwrap(argument))]
+    pub scroll_button: Option<u32>,
+    #[knuffel(child)]
+    pub scroll_button_lock: Option<Flag>,
+    #[knuffel(child)]
+    pub left_handed: Option<Flag>,
+    #[knuffel(child)]
+    pub middle_emulation: Option<Flag>,
+    #[knuffel(child)]
+    pub scroll_factor: Option<ScrollFactor>,
+}
+
+impl MergeWith<MousePart> for Mouse {
+    fn merge_with(&mut self, part: &MousePart) {
+        merge!(
+            (self, part),
+            off,
+            natural_scroll,
+            scroll_button_lock,
+            left_handed,
+            middle_emulation
+        );
+        merge_clone!((self, part), accel_speed);
+        some!(
+            (self, part),
+            accel_profile,
+            scroll_method,
+            scroll_button,
+            scroll_factor
+        );
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct TrackpointPart {
+    #[knuffel(child)]
+    pub off: Option<Flag>,
+    #[knuffel(child)]
+    pub natural_scroll: Option<Flag>,
+    #[knuffel(child, unwrap(argument))]
+    pub accel_speed: Option<FloatOrInt<-1, 1>>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub accel_profile: Option<AccelProfile>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub scroll_method: Option<ScrollMethod>,
+    #[knuffel(child, unwrap(argument))]
+    pub scroll_button: Option<u32>,
+    #[knuffel(child)]
+    pub scroll_button_lock: Option<Flag>,
+    #[knuffel(child)]
+    pub left_handed: Option<Flag>,
+    #[knuffel(child)]
+    pub middle_emulation: Option<Flag>,
+}
+
+impl MergeWith<TrackpointPart> for Trackpoint {
+    fn merge_with(&mut self, part: &TrackpointPart) {
+        merge!(
+            (self, part),
+            off,
+            natural_scroll,
+            scroll_button_lock,
+            left_handed,
+            middle_emulation
+        );
+        merge_clone!((self, part), accel_speed);
+        some!((self, part), accel_profile, scroll_method, scroll_button);
+    }
+}
+
+pub type TrackballPart = TrackpointPart;
+
+impl MergeWith<TrackballPart> for Trackball {
+    fn merge_with(&mut self, part: &TrackballPart) {
+        merge!(
+            (self, part),
+            off,
+            natural_scroll,
+            scroll_button_lock,
+            left_handed,
+            middle_emulation
+        );
+        merge_clone!((self, part), accel_speed);
+        some!((self, part), accel_profile, scroll_method, scroll_button);
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct TabletPart {
+    #[knuffel(child)]
+    pub off: Option<Flag>,
+    #[knuffel(child, unwrap(arguments))]
+    pub calibration_matrix: Option<Vec<f32>>,
+    #[knuffel(child, unwrap(argument))]
+    pub map_to_output: Option<String>,
+    #[knuffel(child)]
+    pub map_to_focused_output: Option<Flag>,
+    #[knuffel(child)]
+    pub left_handed: Option<Flag>,
+}
+
+impl MergeWith<TabletPart> for Tablet {
+    fn merge_with(&mut self, part: &TabletPart) {
+        merge!((self, part), off, map_to_focused_output, left_handed);
+        merge_clone_opt!((self, part), calibration_matrix, map_to_output);
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct TouchPart {
+    #[knuffel(child)]
+    pub off: Option<Flag>,
+    #[knuffel(child, unwrap(arguments))]
+    pub calibration_matrix: Option<Vec<f32>>,
+    #[knuffel(child, unwrap(argument))]
+    pub map_to_output: Option<String>,
+}
+
+impl MergeWith<TouchPart> for Touch {
+    fn merge_with(&mut self, part: &TouchPart) {
+        merge!((self, part), off);
+        merge_clone_opt!((self, part), calibration_matrix, map_to_output);
+    }
 }
 
 #[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]

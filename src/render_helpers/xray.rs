@@ -81,6 +81,7 @@ pub struct XrayElement {
     saturation: f32,
     bg_color: Color32F,
     program: Option<GlesTexProgram>,
+    alpha: f32,
 }
 
 impl Xray {
@@ -202,6 +203,7 @@ impl Xray {
                     saturation,
                     bg_color: *bg_color,
                     program: program.clone(),
+                    alpha: 1.,
                 };
                 push(elem);
             }
@@ -252,6 +254,7 @@ impl Xray {
                 saturation,
                 bg_color: self.backdrop_color,
                 program: program.clone(),
+                alpha: 1.,
             };
             push(elem);
         }
@@ -259,6 +262,12 @@ impl Xray {
 }
 
 impl XrayElement {
+    /// Draw the effect over the framebuffer at this alpha, e.g. while fading in or out.
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.alpha = alpha.clamp(0., 1.);
+        self
+    }
+
     fn compute_uniforms(&self) -> [Uniform<'static>; 7] {
         [
             Uniform::new("niri_scale", self.scale),
@@ -287,6 +296,10 @@ impl Element for XrayElement {
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
         self.geometry.to_physical_precise_round(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.alpha
     }
 
     fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
@@ -350,7 +363,7 @@ impl RenderElement<GlesRenderer> for XrayElement {
             // FIXME: opaque regions need to be filtered like damage.
             &[],
             Transform::Normal,
-            1.,
+            self.alpha,
             self.program.as_ref(),
             uniforms,
         )

@@ -19,6 +19,7 @@ pub struct Animations {
     pub screenshot_ui_open: ScreenshotUiOpenAnim,
     pub overview_open_close: OverviewOpenCloseAnim,
     pub recent_windows_close: RecentWindowsCloseAnim,
+    pub blur_fade: BlurFadeAnim,
 }
 
 impl Default for Animations {
@@ -37,6 +38,7 @@ impl Default for Animations {
             screenshot_ui_open: Default::default(),
             overview_open_close: Default::default(),
             recent_windows_close: Default::default(),
+            blur_fade: Default::default(),
         }
     }
 }
@@ -71,6 +73,8 @@ pub struct AnimationsPart {
     pub overview_open_close: Option<OverviewOpenCloseAnim>,
     #[knuffel(child)]
     pub recent_windows_close: Option<RecentWindowsCloseAnim>,
+    #[knuffel(child)]
+    pub blur_fade: Option<BlurFadeAnim>,
 }
 
 impl MergeWith<AnimationsPart> for Animations {
@@ -97,6 +101,7 @@ impl MergeWith<AnimationsPart> for Animations {
             screenshot_ui_open,
             overview_open_close,
             recent_windows_close,
+            blur_fade,
         );
     }
 }
@@ -495,6 +500,37 @@ where
 }
 
 impl<S> knuffel::Decode<S> for OverviewOpenCloseAnim
+where
+    S: knuffel::traits::ErrorSpan,
+{
+    fn decode_node(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        let default = Self::default().0;
+        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
+            Ok(false)
+        })?))
+    }
+}
+
+/// Fade of a surface-requested background effect (blur region) as it appears and disappears.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlurFadeAnim(pub Animation);
+
+impl Default for BlurFadeAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 140,
+                curve: Curve::EaseOutCubic,
+            }),
+        })
+    }
+}
+
+impl<S> knuffel::Decode<S> for BlurFadeAnim
 where
     S: knuffel::traits::ErrorSpan,
 {

@@ -347,6 +347,25 @@ pub struct Shadow {
     pub draw_behind_window: bool,
     pub color: Color,
     pub inactive_color: Option<Color>,
+    /// Tuned: windows that aren't active may have a shadow of their own size and
+    /// place, not only colour; unset, the active window's.
+    pub inactive_offset: Option<ShadowOffset>,
+    pub inactive_softness: Option<f64>,
+    pub inactive_spread: Option<f64>,
+}
+
+impl Shadow {
+    /// (softness, spread, offset) for an active or inactive window.
+    pub fn geometry(&self, is_active: bool) -> (f64, f64, ShadowOffset) {
+        if is_active {
+            return (self.softness, self.spread, self.offset);
+        }
+        (
+            self.inactive_softness.unwrap_or(self.softness),
+            self.inactive_spread.unwrap_or(self.spread),
+            self.inactive_offset.unwrap_or(self.offset),
+        )
+    }
 }
 
 impl Default for Shadow {
@@ -362,6 +381,9 @@ impl Default for Shadow {
             draw_behind_window: false,
             color: Color::from_rgba8_unpremul(0, 0, 0, 0x77),
             inactive_color: None,
+            inactive_offset: None,
+            inactive_softness: None,
+            inactive_spread: None,
         }
     }
 }
@@ -377,7 +399,13 @@ impl MergeWith<ShadowRule> for Shadow {
 
         merge_clone!((self, part), offset, draw_behind_window, color);
 
-        merge_clone_opt!((self, part), inactive_color);
+        merge_clone_opt!((self, part), inactive_color, inactive_offset);
+        if let Some(x) = part.inactive_softness {
+            self.inactive_softness = Some(x.0);
+        }
+        if let Some(x) = part.inactive_spread {
+            self.inactive_spread = Some(x.0);
+        }
     }
 }
 
@@ -423,7 +451,159 @@ impl From<WorkspaceShadow> for Shadow {
             draw_behind_window: false,
             color: value.color,
             inactive_color: None,
+            inactive_offset: None,
+            inactive_softness: None,
+            inactive_spread: None,
         }
+    }
+}
+
+/// The overview's backdrop blur: grows with the overview's progress (the open and close
+/// animations and the touchpad gesture), from sharp to `radius` once fully open.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverviewBackdropBlur {
+    pub off: bool,
+    /// Logical pixels at full strength.
+    pub radius: f64,
+    pub noise: f64,
+    pub saturation: f64,
+}
+
+impl Default for OverviewBackdropBlur {
+    fn default() -> Self {
+        Self {
+            off: true,
+            radius: 32.,
+            noise: 0.02,
+            saturation: 1.5,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct OverviewBackdropBlurPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub radius: Option<FloatOrInt<0, 1024>>,
+    #[knuffel(child, unwrap(argument))]
+    pub noise: Option<FloatOrInt<0, 1000>>,
+    #[knuffel(child, unwrap(argument))]
+    pub saturation: Option<FloatOrInt<0, 1000>>,
+}
+
+impl MergeWith<OverviewBackdropBlurPart> for OverviewBackdropBlur {
+    fn merge_with(&mut self, part: &OverviewBackdropBlurPart) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+
+        merge!((self, part), radius, noise, saturation);
+    }
+}
+
+/// Each workspace's area in the overview: a fill inside it and a border outside it, faded
+/// in and out with the overview (never drawn outside it, as in a workspace switch). Square,
+/// as the workspace, its shadow and windows at its edge are.
+///
+/// Each colour and its opacity are separate settings, so a desktop's theme can give the
+/// colours and its user change an opacity alone (or the other way round): a colour's own
+/// alpha is ignored, the opacity is the only transparency.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceHighlight {
+    pub off: bool,
+    /// Screen pixels, whatever the overview zoom; 0: no border.
+    pub border_width: f64,
+    pub fill_color: Color,
+    pub fill_opacity: f64,
+    pub active_border_color: Color,
+    pub active_border_opacity: f64,
+    pub inactive_border_color: Color,
+    pub inactive_border_opacity: f64,
+}
+
+impl WorkspaceHighlight {
+    /// The colours as drawn: each colour's RGB at its opacity.
+    pub fn fill(&self) -> Color {
+        with_opacity(self.fill_color, self.fill_opacity)
+    }
+
+    pub fn active_border(&self) -> Color {
+        with_opacity(self.active_border_color, self.active_border_opacity)
+    }
+
+    pub fn inactive_border(&self) -> Color {
+        with_opacity(self.inactive_border_color, self.inactive_border_opacity)
+    }
+}
+
+fn with_opacity(color: Color, opacity: f64) -> Color {
+    Color {
+        a: opacity.clamp(0., 1.) as f32,
+        ..color
+    }
+}
+
+impl Default for WorkspaceHighlight {
+    fn default() -> Self {
+        Self {
+            off: true,
+            border_width: 1.,
+            fill_color: Color::from_rgba8_unpremul(255, 255, 255, 255),
+            fill_opacity: 0.06,
+            active_border_color: Color::from_rgba8_unpremul(255, 255, 255, 255),
+            active_border_opacity: 0.5,
+            inactive_border_color: Color::from_rgba8_unpremul(255, 255, 255, 255),
+            inactive_border_opacity: 0.19,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct WorkspaceHighlightPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub border_width: Option<FloatOrInt<0, 64>>,
+    #[knuffel(child)]
+    pub fill_color: Option<Color>,
+    #[knuffel(child, unwrap(argument))]
+    pub fill_opacity: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child)]
+    pub active_border_color: Option<Color>,
+    #[knuffel(child, unwrap(argument))]
+    pub active_border_opacity: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child)]
+    pub inactive_border_color: Option<Color>,
+    #[knuffel(child, unwrap(argument))]
+    pub inactive_border_opacity: Option<FloatOrInt<0, 1>>,
+}
+
+impl MergeWith<WorkspaceHighlightPart> for WorkspaceHighlight {
+    fn merge_with(&mut self, part: &WorkspaceHighlightPart) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+
+        merge!(
+            (self, part),
+            border_width,
+            fill_opacity,
+            active_border_opacity,
+            inactive_border_opacity
+        );
+        merge_clone!(
+            (self, part),
+            fill_color,
+            active_border_color,
+            inactive_border_color
+        );
     }
 }
 
@@ -662,6 +842,12 @@ pub struct ShadowRule {
     pub color: Option<Color>,
     #[knuffel(child)]
     pub inactive_color: Option<Color>,
+    #[knuffel(child)]
+    pub inactive_offset: Option<ShadowOffset>,
+    #[knuffel(child, unwrap(argument))]
+    pub inactive_softness: Option<FloatOrInt<0, 1024>>,
+    #[knuffel(child, unwrap(argument))]
+    pub inactive_spread: Option<FloatOrInt<-1024, 1024>>,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
@@ -1348,5 +1534,468 @@ mod tests {
         )
         "
         );
+    }
+}
+
+/// Server-side title bar drawn by niri above windows that use server-side decorations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Titlebar {
+    pub off: bool,
+    pub height: f64,
+    /// Pango font description, e.g. "Inter Medium 13px".
+    pub font: String,
+    pub active_color: Color,
+    pub inactive_color: Color,
+    pub active_text_color: Color,
+    pub inactive_text_color: Color,
+    /// The buttons' circles: on the focused window, an unfocused one (unset: the same) and
+    /// under the pointer (unset: lightened by `button_hover_brighten`).
+    pub button_color: Color,
+    pub button_inactive_color: Option<Color>,
+    pub button_hover_color: Option<Color>,
+    /// The buttons' icons: on the focused window (unset: `active_text_color`), an unfocused one
+    /// (unset: `inactive_text_color`) and under the pointer (unset: as without it).
+    pub button_icon_color: Option<Color>,
+    pub button_icon_inactive_color: Option<Color>,
+    pub button_icon_hover_color: Option<Color>,
+    /// Close's red circle (when `close_red` says) and its icon on it.
+    pub close_hover_color: Color,
+    pub button_hover_text_color: Color,
+    /// Each button's own colours, over the ones above.
+    pub button_styles: TitlebarButtonStyles,
+    /// When the buttons' circles show: always (the default) or on hover.
+    pub button_highlight: TitlebarButtonHighlight,
+    /// When the close button's circle is red: on hover (the default), on the focused window,
+    /// or always.
+    pub close_red: TitlebarCloseRed,
+    /// Side of each button's square slot, centred on the bar's height.
+    pub button_size: f64,
+    /// Diameter of a button's circle.
+    pub button_circle: f64,
+    /// Side of a button's icon (its whole view box).
+    pub icon_size: f64,
+    /// Gap between the outermost button and the bar's edge.
+    pub button_edge_gap: f64,
+    /// Gap between the title and the buttons.
+    pub title_gap: f64,
+    /// How much hover brightens an always-shown circle (white over it, 0 to 1).
+    pub button_hover_brighten: f64,
+    pub buttons_position: TitlebarButtonsPosition,
+    /// The buttons, from the bar's edge inwards.
+    pub buttons: Vec<TitlebarButton>,
+    /// The `menu` button's command: spawned on a click with the window's id, its output's name,
+    /// the pointer's position on that output (logical x and y) and the window's state
+    /// (`floating`, `maximized`, `fullscreen`, comma-separated, or `-`) appended, for a shell to
+    /// open the window's menu there. Empty: the button does nothing.
+    pub menu_command: Vec<String>,
+    /// Run when a view scrolls, switches workspace or the overview opens or closes while a
+    /// layer surface named `menu_namespace` is open (a shell menu), so it closes rather than
+    /// stay put away from what it belongs to. Empty: nothing.
+    pub menu_close_command: Vec<String>,
+    /// The layer-shell namespace of the shell's menus, for `menu_close_command`.
+    pub menu_namespace: String,
+    /// Each button's icon, unset for the built-in one.
+    pub icons: TitlebarIcons,
+    /// A unified toolbar (macOS's name): the window's content extends under the bar, which
+    /// draws only its buttons, for apps that paint their own top area (a sidebar running to the
+    /// top, their toolbar in the bar's row). Set with `unified` (or its old name `transparent`).
+    pub transparent: bool,
+    /// The pointer on any button shows every button's hover icon (macOS: hovering the
+    /// traffic lights shows all three glyphs); the circles still follow the one hovered.
+    pub button_hover_group: bool,
+}
+
+impl Default for Titlebar {
+    fn default() -> Self {
+        Self {
+            off: true,
+            height: 30.,
+            font: String::from("sans Medium 12px"),
+            active_color: Color::from_rgba8_unpremul(0x2c, 0x2c, 0x2e, 0xff),
+            inactive_color: Color::from_rgba8_unpremul(0x1c, 0x1c, 0x1e, 0xff),
+            active_text_color: Color::from_rgba8_unpremul(0xf2, 0xf2, 0xf7, 0xff),
+            inactive_text_color: Color::from_rgba8_unpremul(0x8e, 0x8e, 0x93, 0xff),
+            button_color: Color::from_rgba8_unpremul(0xff, 0xff, 0xff, 0x26),
+            button_inactive_color: None,
+            button_hover_color: None,
+            button_icon_color: None,
+            button_icon_inactive_color: None,
+            button_icon_hover_color: None,
+            button_styles: TitlebarButtonStyles::default(),
+            close_hover_color: Color::from_rgba8_unpremul(0xff, 0x45, 0x3a, 0xff),
+            button_hover_text_color: Color::from_rgba8_unpremul(0xff, 0xff, 0xff, 0xff),
+            button_highlight: TitlebarButtonHighlight::Always,
+            close_red: TitlebarCloseRed::Hover,
+            button_size: 30.,
+            button_circle: 22.,
+            icon_size: 15.,
+            button_edge_gap: 4.,
+            title_gap: 8.,
+            button_hover_brighten: 0.14,
+            buttons_position: TitlebarButtonsPosition::Left,
+            buttons: vec![TitlebarButton::Close, TitlebarButton::MaximizeColumn],
+            menu_command: Vec::new(),
+            menu_close_command: Vec::new(),
+            menu_namespace: String::new(),
+            icons: TitlebarIcons::default(),
+            transparent: false,
+            button_hover_group: false,
+        }
+    }
+}
+
+/// Title bar button icons: a built-in Phosphor name (`x`, `square`, `cards`, `square-split-horizontal`,
+/// `plus`, `minus`,
+/// `arrows-out-simple`, `arrows-in-simple`, `corners-out`, `corners-in`,
+/// `arrows-out-line-horizontal`, `dots-three`) or an SVG file (`~/...` or absolute: its `<path>`s, filled, or
+/// stroked when the SVG says `fill="none"`), read when the config loads. The `-active` ones are
+/// shown while the toggle is on (zoom and maximize: maximized or fullscreen; float: floating;
+/// fullscreen: fullscreen), the plain one when unset.
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct TitlebarIcons {
+    #[knuffel(child, unwrap(argument))]
+    pub close: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub zoom: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub zoom_active: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub float: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub float_active: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub maximize: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub maximize_active: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub maximize_column: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub fullscreen: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub fullscreen_active: Option<String>,
+    #[knuffel(child, unwrap(argument))]
+    pub menu: Option<String>,
+}
+
+impl MergeWith<TitlebarIcons> for TitlebarIcons {
+    fn merge_with(&mut self, part: &TitlebarIcons) {
+        merge_clone_opt!(
+            (self, part),
+            close,
+            zoom,
+            zoom_active,
+            float,
+            float_active,
+            maximize,
+            maximize_active,
+            maximize_column,
+            fullscreen,
+            fullscreen_active,
+            menu,
+        );
+    }
+}
+
+/// One button's colours, each unset for the title bar's.
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct TitlebarButtonStyle {
+    #[knuffel(child)]
+    pub color: Option<Color>,
+    #[knuffel(child)]
+    pub inactive_color: Option<Color>,
+    #[knuffel(child)]
+    pub hover_color: Option<Color>,
+    #[knuffel(child)]
+    pub icon_color: Option<Color>,
+    #[knuffel(child)]
+    pub icon_inactive_color: Option<Color>,
+    #[knuffel(child)]
+    pub icon_hover_color: Option<Color>,
+}
+
+impl MergeWith<Self> for TitlebarButtonStyle {
+    fn merge_with(&mut self, part: &Self) {
+        merge_clone_opt!(
+            (self, part),
+            color,
+            inactive_color,
+            hover_color,
+            icon_color,
+            icon_inactive_color,
+            icon_hover_color,
+        );
+    }
+}
+
+/// Per-button colours (`button-styles { close { hover-color ...; } }`).
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct TitlebarButtonStyles {
+    #[knuffel(child)]
+    pub close: Option<TitlebarButtonStyle>,
+    #[knuffel(child)]
+    pub zoom: Option<TitlebarButtonStyle>,
+    #[knuffel(child)]
+    pub float: Option<TitlebarButtonStyle>,
+    #[knuffel(child)]
+    pub maximize: Option<TitlebarButtonStyle>,
+    #[knuffel(child)]
+    pub maximize_column: Option<TitlebarButtonStyle>,
+    #[knuffel(child)]
+    pub fullscreen: Option<TitlebarButtonStyle>,
+    #[knuffel(child)]
+    pub menu: Option<TitlebarButtonStyle>,
+}
+
+impl TitlebarButtonStyles {
+    pub fn get(&self, button: TitlebarButton) -> TitlebarButtonStyle {
+        match button {
+            TitlebarButton::Close => self.close,
+            TitlebarButton::Zoom => self.zoom,
+            TitlebarButton::Float => self.float,
+            TitlebarButton::Maximize => self.maximize,
+            TitlebarButton::MaximizeColumn => self.maximize_column,
+            TitlebarButton::Fullscreen => self.fullscreen,
+            TitlebarButton::Menu => self.menu,
+        }
+        .unwrap_or_default()
+    }
+}
+
+impl MergeWith<Self> for TitlebarButtonStyles {
+    fn merge_with(&mut self, part: &Self) {
+        for (mine, theirs) in [
+            (&mut self.close, &part.close),
+            (&mut self.zoom, &part.zoom),
+            (&mut self.float, &part.float),
+            (&mut self.maximize, &part.maximize),
+            (&mut self.maximize_column, &part.maximize_column),
+            (&mut self.fullscreen, &part.fullscreen),
+            (&mut self.menu, &part.menu),
+        ] {
+            if let Some(x) = theirs {
+                mine.get_or_insert_with(Default::default).merge_with(x);
+            }
+        }
+    }
+}
+
+/// A title bar button.
+#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TitlebarButton {
+    Close,
+    /// Between floating and maximized: on a floating (or tiled) window it maximizes it into the
+    /// columns, on a maximized one it floats it (Alt-click: fullscreen).
+    Zoom,
+    /// Toggles floating.
+    Float,
+    /// Toggles maximized to the edges (Alt-click: fullscreen).
+    Maximize,
+    /// Toggles the column's full width.
+    MaximizeColumn,
+    Fullscreen,
+    /// Opens the window's menu: spawns `menu-command` (see `Titlebar::menu_command`).
+    Menu,
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq)]
+pub enum TitlebarCloseRed {
+    Hover,
+    Focused,
+    Always,
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq)]
+pub enum TitlebarButtonHighlight {
+    Always,
+    Hover,
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq)]
+pub enum TitlebarButtonsPosition {
+    Left,
+    Right,
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct TitlebarRule {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub height: Option<FloatOrInt<0, 1024>>,
+    #[knuffel(child, unwrap(argument))]
+    pub font: Option<String>,
+    #[knuffel(child)]
+    pub active_color: Option<Color>,
+    #[knuffel(child)]
+    pub inactive_color: Option<Color>,
+    #[knuffel(child)]
+    pub active_text_color: Option<Color>,
+    #[knuffel(child)]
+    pub inactive_text_color: Option<Color>,
+    #[knuffel(child)]
+    pub button_color: Option<Color>,
+    #[knuffel(child)]
+    pub button_inactive_color: Option<Color>,
+    #[knuffel(child)]
+    pub button_hover_color: Option<Color>,
+    #[knuffel(child)]
+    pub button_icon_color: Option<Color>,
+    #[knuffel(child)]
+    pub button_icon_inactive_color: Option<Color>,
+    #[knuffel(child)]
+    pub button_icon_hover_color: Option<Color>,
+    #[knuffel(child)]
+    pub button_styles: Option<TitlebarButtonStyles>,
+    #[knuffel(child)]
+    pub close_hover_color: Option<Color>,
+    #[knuffel(child)]
+    pub button_hover_text_color: Option<Color>,
+    #[knuffel(child, unwrap(argument))]
+    pub button_highlight: Option<TitlebarButtonHighlight>,
+    #[knuffel(child, unwrap(argument))]
+    pub close_red: Option<TitlebarCloseRed>,
+    #[knuffel(child, unwrap(argument))]
+    pub button_size: Option<FloatOrInt<1, 256>>,
+    #[knuffel(child, unwrap(argument))]
+    pub button_circle: Option<FloatOrInt<0, 256>>,
+    #[knuffel(child, unwrap(argument))]
+    pub icon_size: Option<FloatOrInt<1, 256>>,
+    #[knuffel(child, unwrap(argument))]
+    pub button_edge_gap: Option<FloatOrInt<0, 256>>,
+    #[knuffel(child, unwrap(argument))]
+    pub title_gap: Option<FloatOrInt<0, 256>>,
+    #[knuffel(child, unwrap(argument))]
+    pub button_hover_brighten: Option<FloatOrInt<0, 1>>,
+    #[knuffel(child, unwrap(argument))]
+    pub buttons_position: Option<TitlebarButtonsPosition>,
+    #[knuffel(child, unwrap(arguments))]
+    pub buttons: Option<Vec<TitlebarButton>>,
+    #[knuffel(child, unwrap(arguments))]
+    pub menu_command: Option<Vec<String>>,
+    #[knuffel(child, unwrap(arguments))]
+    pub menu_close_command: Option<Vec<String>>,
+    #[knuffel(child, unwrap(argument))]
+    pub menu_namespace: Option<String>,
+    #[knuffel(child)]
+    pub icons: Option<TitlebarIcons>,
+    #[knuffel(child)]
+    pub unified: Option<Flag>,
+    /// The old name of `unified`.
+    #[knuffel(child)]
+    pub transparent: Option<Flag>,
+    #[knuffel(child)]
+    pub button_hover_group: Option<Flag>,
+}
+
+impl MergeWith<TitlebarRule> for Titlebar {
+    fn merge_with(&mut self, part: &TitlebarRule) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+
+        if let Some(x) = part.unified.or(part.transparent) {
+            self.transparent = x.0;
+        }
+        if let Some(x) = part.button_hover_group {
+            self.button_hover_group = x.0;
+        }
+        merge!(
+            (self, part),
+            height,
+            icons,
+            button_size,
+            button_circle,
+            icon_size,
+            button_edge_gap,
+            title_gap,
+            button_hover_brighten,
+        );
+
+        merge_clone!(
+            (self, part),
+            font,
+            active_color,
+            inactive_color,
+            active_text_color,
+            inactive_text_color,
+            button_color,
+            close_hover_color,
+            button_hover_text_color,
+            button_highlight,
+            close_red,
+            buttons_position,
+            buttons,
+            menu_command,
+            menu_close_command,
+            menu_namespace,
+        );
+
+        merge_clone_opt!(
+            (self, part),
+            button_inactive_color,
+            button_hover_color,
+            button_icon_color,
+            button_icon_inactive_color,
+            button_icon_hover_color,
+        );
+
+        if let Some(x) = &part.button_styles {
+            self.button_styles.merge_with(x);
+        }
+    }
+}
+
+impl MergeWith<Self> for TitlebarRule {
+    fn merge_with(&mut self, part: &Self) {
+        merge_on_off!((self, part));
+
+        merge_clone_opt!(
+            (self, part),
+            height,
+            font,
+            active_color,
+            inactive_color,
+            active_text_color,
+            inactive_text_color,
+            button_color,
+            button_inactive_color,
+            button_hover_color,
+            button_icon_color,
+            button_icon_inactive_color,
+            button_icon_hover_color,
+            close_hover_color,
+            button_hover_text_color,
+            button_highlight,
+            close_red,
+            button_size,
+            button_circle,
+            icon_size,
+            button_edge_gap,
+            title_gap,
+            button_hover_brighten,
+            buttons_position,
+            buttons,
+            menu_command,
+            menu_close_command,
+            menu_namespace,
+            unified,
+            transparent,
+            button_hover_group,
+        );
+
+        if let Some(x) = &part.button_styles {
+            self.button_styles
+                .get_or_insert_with(Default::default)
+                .merge_with(x);
+        }
+
+        if let Some(x) = &part.icons {
+            self.icons
+                .get_or_insert_with(Default::default)
+                .merge_with(x);
+        }
     }
 }

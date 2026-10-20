@@ -200,6 +200,39 @@ include "laptop.kdl"
 // End result: both DP-2 and eDP-1 settings.
 ```
 
+<sup>Tuned build</sup> A named `window-rule` is the exception: a later rule with the same name is placed right after the earlier one instead of at the end, so it changes that rule where it stands among the others.
+It applies to the same windows unless it has a `match` or `exclude` of its own, and only what it sets changes, inside blocks such as `border` too.
+`off` switches every earlier rule of that name off.
+This lets a file of defaults be included and changed or turned off from another file without editing it:
+
+```kdl
+// defaults.kdl
+window-rule "calculator" {
+    match app-id="^calculator$"
+    open-floating true
+}
+
+window-rule "dialogs" {
+    match app-id="^dialog$"
+    open-floating true
+}
+```
+
+```kdl,must-fail
+// config.kdl
+include "defaults.kdl"
+
+// Calculator opens tiled; nothing else about its rule changes.
+window-rule "calculator" {
+    open-floating false
+}
+
+// The dialogs rule no longer applies.
+window-rule "dialogs" {
+    off
+}
+```
+
 #### Binds
 
 `binds` will override previously-defined conflicting keys:
@@ -218,6 +251,18 @@ include "binds.kdl"
 binds {
     // Overrides Mod+T from binds.kdl.
     Mod+T { spawn "foot"; }
+}
+```
+
+<sup>Tuned build</sup> `unbind` removes an earlier binding of a key without binding it to anything, so the key reaches the focused window again:
+
+```kdl,must-fail
+// config.kdl
+include "binds.kdl"
+
+binds {
+    // Mod+T from binds.kdl is gone.
+    Mod+T { unbind; }
 }
 ```
 
@@ -245,7 +290,9 @@ include "csd.kdl"
 #### Non-merging sections
 
 Some sections where the contents represent a combined structure are not merged.
-Examples are `struts`, `preset-column-widths`, individual subsections in `animations`, pointing device sections in `input`.
+Examples are `struts`, `preset-column-widths`, individual subsections in `animations`.
+
+<sup>Tuned build</sup> The pointing device sections in `input` (`touchpad`, `mouse`, `trackpoint`, `trackball`, `tablet`, `touch`) do merge, setting by setting, and their flags can be switched off with `false` (`tap false`).
 
 ```kdl
 // struts.kdl

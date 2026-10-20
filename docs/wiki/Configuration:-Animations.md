@@ -62,6 +62,11 @@ animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
     }
+
+    blur-fade {
+        duration-ms 140
+        curve "ease-out-cubic"
+    }
 }
 ```
 
@@ -436,6 +441,28 @@ The close fade-out animation of the recent windows switcher.
 animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
+    }
+}
+```
+
+#### `blur-fade`
+
+<sup>Since: niri-tuned</sup>
+
+The fade of a layer surface's own background blur (requested through `ext-background-effect`) when the surface starts or stops requesting a blur region.
+
+The protocol has no alpha, so a client fading its surface in or out cannot fade the blur behind it.
+With this animation, the blur fades in when a surface first sets a non-empty blur region, and fades out, still in the last region's shape, when it unsets or empties it.
+To fade a panel together with its blur, the client sets the region as it starts fading in and drops it as it starts fading out, and uses the same duration and curve for its own fade.
+Moving, resizing or reshaping a region that stays non-empty applies at once.
+
+Windows, pop-ups and rule-enabled (`background-effect { blur true; }`) effects are not faded.
+
+```kdl
+animations {
+    blur-fade {
+        duration-ms 140
+        curve "ease-out-cubic"
     }
 }
 ```

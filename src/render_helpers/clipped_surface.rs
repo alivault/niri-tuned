@@ -1,12 +1,14 @@
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
-use smithay::backend::renderer::buffer_y_inverted;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::surface::{
+    WaylandSurfaceRenderElement, WaylandSurfaceTexture,
+};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
 };
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::{buffer_y_inverted, Texture as _};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
@@ -22,12 +24,168 @@ pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
+    /// Final thumbnail-to-window ratio; None keeps the ordinary clipping path.
+    thumbnail_scale: Option<f32>,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct RoundedCornerDamage {
     damage: ExtraDamage,
     corner_radius: CornerRadius,
+}
+
+#[derive(Debug, PartialEq)]
+struct ThumbnailSampling {
+    area: (f32, f32),
+    count: (f32, f32),
+    bounds: (f32, f32, f32, f32),
+}
+
+impl ThumbnailSampling {
+    fn new(
+        src: Rectangle<f64, Buffer>,
+        view: Rectangle<f64, Buffer>,
+        dst: Size<i32, Physical>,
+        buffer: Size<i32, Buffer>,
+        transform: Transform,
+        y_inverted: bool,
+    ) -> Self {
+        // Express destination dimensions in buffer orientation, including 90°
+        // rotations. Source/view coordinates are already in buffer space.
+        let dst = transform.transform_size(dst);
+        let axis = |span: f64, start: f64, extent: f64, pixels: i32, texels: i32| {
+            let texels = f64::from(texels.max(1));
+            let footprint = span / f64::from(pixels.max(1));
+            let inset = 0.5_f64.min(extent / 2.);
+            (
+                (footprint / texels) as f32,
+                footprint.ceil().clamp(1., 8.) as f32,
+                ((start + inset) / texels) as f32,
+                ((start + extent - inset) / texels) as f32,
+            )
+        };
+        let x = axis(src.size.w, view.loc.x, view.size.w, dst.w, buffer.w);
+        let y = axis(src.size.h, view.loc.y, view.size.h, dst.h, buffer.h);
+        // Smithay negates texture Y for inverted imports; preserve its texture
+        // addressing convention rather than clamping those coordinates to zero.
+        let (y_min, y_max) = if y_inverted { (-y.3, -y.2) } else { (y.2, y.3) };
+        Self {
+            area: (x.0, y.0),
+            count: (x.1, y.1),
+            bounds: (x.2, y_min, x.3, y_max),
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use super::*;
+
+    #[test]
+    fn sample_footprint_respects_scale_rotation_crop_and_inversion() {
+        let view = Rectangle::new(Point::new(100., 20.), Size::new(800., 600.));
+        let buffer = Size::new(1200, 1000);
+        let reference = ThumbnailSampling::new(
+            view,
+            view,
+            Size::new(160, 120),
+            buffer,
+            Transform::Normal,
+            false,
+        );
+        assert_eq!(reference.count, (5., 5.));
+        assert_eq!(reference.area, ((5. / 1200.) as f32, 0.005));
+        assert_eq!(
+            reference.bounds,
+            (
+                (100.5 / 1200.) as f32,
+                0.0205,
+                (899.5 / 1200.) as f32,
+                0.6195
+            )
+        );
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let dst = transform.transform_size(Size::new(160, 120));
+            assert_eq!(
+                ThumbnailSampling::new(view, view, dst, buffer, transform, false),
+                reference
+            );
+        }
+        let inverted = ThumbnailSampling::new(
+            view,
+            view,
+            Size::new(160, 120),
+            buffer,
+            Transform::Normal,
+            true,
+        );
+        assert_eq!(inverted.bounds.1, -reference.bounds.3);
+        assert_eq!(inverted.bounds.3, -reference.bounds.1);
+        // Cropping a draw must not change the sampling grid or clamp at damage edges.
+        let cropped = Rectangle::new(view.loc, Size::new(400., 300.));
+        assert_eq!(
+            ThumbnailSampling::new(
+                cropped,
+                view,
+                Size::new(80, 60),
+                buffer,
+                Transform::Normal,
+                false
+            ),
+            reference
+        );
+    }
+
+    #[test]
+    fn sample_budget_is_bounded_and_magnification_uses_one_sample() {
+        let view = Rectangle::from_size(Size::new(4096., 4096.));
+        let buffer = Size::new(4096, 4096);
+        assert_eq!(
+            ThumbnailSampling::new(
+                view,
+                view,
+                Size::new(16, 16),
+                buffer,
+                Transform::Normal,
+                false
+            )
+            .count,
+            (8., 8.)
+        );
+        assert_eq!(
+            ThumbnailSampling::new(
+                view,
+                view,
+                Size::new(8192, 8192),
+                buffer,
+                Transform::Normal,
+                false
+            )
+            .count,
+            (1., 1.)
+        );
+        let tiny = Rectangle::new(Point::new(1., 2.), Size::new(0.25, 0.5));
+        let sampling = ThumbnailSampling::new(
+            tiny,
+            tiny,
+            Size::new(1, 1),
+            buffer,
+            Transform::Normal,
+            false,
+        );
+        assert_eq!(sampling.count, (1., 1.));
+        assert_eq!(sampling.bounds.0, sampling.bounds.2);
+        assert_eq!(sampling.bounds.1, sampling.bounds.3);
+    }
 }
 
 impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
@@ -44,10 +202,24 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
             corner_radius,
             geometry,
             scale: scale.x as f32,
+            thumbnail_scale: None,
         }
     }
 
-    fn compute_uniforms(&self) -> Vec<Uniform<'static>> {
+    pub fn with_thumbnail_filter(mut self, scale: f64) -> Self {
+        self.thumbnail_scale = Some(scale as f32);
+        self
+    }
+
+    pub fn thumbnail_shader(renderer: &mut R) -> Option<&GlesTexProgram> {
+        Shaders::get(renderer).thumbnail.as_ref()
+    }
+
+    fn compute_uniforms(
+        &self,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+    ) -> Vec<Uniform<'static>> {
         let scale = Scale::from(f64::from(self.scale));
         let elem_geo = self.inner.geometry(scale);
 
@@ -91,12 +263,47 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
 
         let geo_size = (self.geometry.size.w as f32, self.geometry.size.h as f32);
 
-        vec![
-            Uniform::new("niri_scale", self.scale),
+        let mut uniforms = vec![
+            Uniform::new(
+                "niri_scale",
+                self.scale * self.thumbnail_scale.unwrap_or(1.),
+            ),
             Uniform::new("geo_size", geo_size),
             Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
             mat3_uniform("input_to_geo", input_to_geo),
-        ]
+        ];
+        if self.thumbnail_scale.is_some() {
+            // Use imported texture metadata, never map a wl_shm buffer here:
+            // screencopy may already hold a SHM pool write guard.
+            let size = match self.inner.texture() {
+                WaylandSurfaceTexture::Texture(texture) => Some(texture.size()),
+                WaylandSurfaceTexture::SolidColor(_) => None,
+            };
+            let sampling = size
+                .map(|size| {
+                    ThumbnailSampling::new(
+                        src,
+                        self.inner.src(),
+                        dst.size,
+                        size,
+                        self.inner.transform(),
+                        buffer_y_inverted(self.inner.buffer()).unwrap_or(false),
+                    )
+                })
+                // An unrecognized import must remain visible: one ordinary
+                // bilinear sample, without assuming a texture size or Y flip.
+                .unwrap_or(ThumbnailSampling {
+                    area: (0., 0.),
+                    count: (1., 1.),
+                    bounds: (-2., -2., 2., 2.),
+                });
+            uniforms.extend([
+                Uniform::new("sample_area", sampling.area),
+                Uniform::new("sample_count", sampling.count),
+                Uniform::new("sample_bounds", sampling.bounds),
+            ]);
+        }
+        uniforms
     }
 
     pub fn shader(renderer: &mut R) -> Option<&GlesTexProgram> {
@@ -183,6 +390,13 @@ impl<R: NiriRenderer> Element for ClippedSurfaceRenderElement<R> {
         // FIXME: radius changes need to cause damage.
         let damage = self.inner.damage_since(scale, commit);
 
+        // A changed texel also contributes to neighboring destination pixels.
+        // These surfaces are tiny on screen: conservatively repaint the whole
+        // thumbnail surface instead of leaving stale filtered fringes.
+        if self.thumbnail_scale.is_some() && !damage.is_empty() {
+            return DamageSet::from_slice(&[Rectangle::from_size(self.geometry(scale).size)]);
+        }
+
         // Intersect with geometry, since we're clipping by it.
         let mut geo = self.geometry.to_physical_precise_round(scale);
         geo.loc -= self.geometry(scale).loc;
@@ -193,6 +407,10 @@ impl<R: NiriRenderer> Element for ClippedSurfaceRenderElement<R> {
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        // Filtering can mix opaque pixels with neighboring transparent pixels.
+        if self.thumbnail_scale.is_some() {
+            return OpaqueRegions::default();
+        }
         let regions = self.inner.opaque_regions(scale);
 
         // Intersect with geometry, since we're clipping by it.
@@ -238,8 +456,8 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        frame.override_default_tex_program(self.program.clone(), self.compute_uniforms());
-        RenderElement::<GlesRenderer>::draw(
+        frame.override_default_tex_program(self.program.clone(), self.compute_uniforms(src, dst));
+        let result = RenderElement::<GlesRenderer>::draw(
             &self.inner,
             frame,
             src,
@@ -247,9 +465,9 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
             damage,
             opaque_regions,
             cache,
-        )?;
+        );
         frame.clear_tex_program_override();
-        Ok(())
+        result
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
@@ -273,10 +491,11 @@ impl<'render> RenderElement<TtyRenderer<'render>>
     ) -> Result<(), TtyRendererError<'render>> {
         frame
             .as_gles_frame()
-            .override_default_tex_program(self.program.clone(), self.compute_uniforms());
-        RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache)?;
+            .override_default_tex_program(self.program.clone(), self.compute_uniforms(src, dst));
+        let result =
+            RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache);
         frame.as_gles_frame().clear_tex_program_override();
-        Ok(())
+        result
     }
 
     fn underlying_storage(

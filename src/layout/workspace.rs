@@ -468,6 +468,13 @@ impl<W: LayoutElement> Workspace<W> {
         self.output.as_ref()
     }
 
+    /// Number of windows in the active tiled column, if there is one.
+    pub fn active_column_window_count(&self) -> Option<usize> {
+        self.scrolling
+            .active_column()
+            .map(|col| col.tiles().count())
+    }
+
     pub fn active_window(&self) -> Option<&W> {
         if self.floating_is_active.get() {
             self.floating.active_window()
@@ -800,6 +807,12 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    /// Whether a new window opening here (not floating, without a window rule or a request of
+    /// its own) opens maximized to the edges: `layout { open-maximized-to-edges }`.
+    pub fn opens_maximized_by_default(&self, is_floating: bool) -> bool {
+        !is_floating && self.options.layout.open_maximized_to_edges
+    }
+
     pub fn resolve_default_height(
         &self,
         default_height: Option<Option<PresetSize>>,
@@ -867,7 +880,18 @@ impl<W: LayoutElement> Workspace<W> {
             if state.states.contains(xdg_toplevel::State::Fullscreen) {
                 state.size = Some(self.view_size.to_i32_round());
             } else if state.states.contains(xdg_toplevel::State::Maximized) {
-                state.size = Some(self.working_area.size.to_i32_round());
+                // Assume the window will take server-side decorations, as it will if it can.
+                let titlebar = self
+                    .options
+                    .layout
+                    .titlebar
+                    .clone()
+                    .merged_with(&rules.titlebar);
+                let mut size = self.working_area.size;
+                if !titlebar.off {
+                    size.h = f64::max(1., size.h - titlebar.height);
+                }
+                state.size = Some(size.to_i32_round());
             } else {
                 let size =
                     self.new_window_size(width, height, is_floating, rules, (min_size, max_size));
@@ -1800,6 +1824,32 @@ impl<W: LayoutElement> Workspace<W> {
             })
     }
 
+    /// The window whose edge `pos` is on, and which edges, for resizing by dragging an edge
+    /// (see [`Tile::edge_resize_edges`]). The topmost window under `pos` owns it: a point on a
+    /// window, or its title bar, is not another's edge.
+    pub fn edge_resize_under(&self, pos: Point<f64, Logical>) -> Option<(&W, ResizeEdge)> {
+        for (tile, tile_pos, visible) in self.tiles_with_render_positions() {
+            if !visible {
+                continue;
+            }
+            let pos_within_tile = pos - tile_pos;
+            if let Some(edges) = tile.edge_resize_edges(pos_within_tile) {
+                // Inside the window's input region or on its title bar the window keeps it.
+                return match tile.hit(pos_within_tile) {
+                    Some(HitType::Input { .. })
+                    | Some(HitType::Activate {
+                        titlebar: Some(_), ..
+                    }) => None,
+                    _ => Some((tile.window(), edges)),
+                };
+            }
+            if tile.hit(pos_within_tile).is_some() {
+                return None;
+            }
+        }
+        None
+    }
+
     pub fn descendants_added(&mut self, id: &W::Id) -> bool {
         self.floating.descendants_added(id)
     }
@@ -1975,6 +2025,22 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn layout_config(&self) -> Option<&niri_config::LayoutPart> {
         self.layout_config.as_ref()
+    }
+
+    /// The scrolling layout's target view position (Monitor::view_target).
+    pub fn target_view_pos(&self) -> f64 {
+        self.scrolling.target_view_pos()
+    }
+
+    /// How far the scrolling layout's view still has to move (target minus current): tiled
+    /// windows will end up this much further left on screen.
+    pub fn view_travel(&self) -> f64 {
+        self.scrolling.target_view_pos() - self.scrolling.view_pos()
+    }
+
+    /// Where the view is among the columns, for IPC; see [`ScrollingSpace::ipc_view_column`].
+    pub fn ipc_view_column(&self) -> Option<super::scrolling::IpcViewColumn> {
+        self.scrolling.ipc_view_column()
     }
 
     #[cfg(test)]

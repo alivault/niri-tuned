@@ -2,10 +2,12 @@ use knuffel::errors::DecodeError;
 use niri_ipc::{ColumnDisplay, SizeChange};
 
 use crate::appearance::{
-    Border, FocusRing, InsertHint, Shadow, TabIndicator, DEFAULT_BACKGROUND_COLOR,
+    Border, FocusRing, InsertHint, Shadow, TabIndicator, Titlebar, DEFAULT_BACKGROUND_COLOR,
 };
 use crate::utils::{expect_only_children, Flag, MergeWith};
-use crate::{BorderRule, Color, FloatOrInt, InsertHintPart, ShadowRule, TabIndicatorPart};
+use crate::{
+    BorderRule, Color, FloatOrInt, InsertHintPart, ShadowRule, TabIndicatorPart, TitlebarRule,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layout {
@@ -13,13 +15,24 @@ pub struct Layout {
     pub border: Border,
     pub shadow: Shadow,
     pub tab_indicator: TabIndicator,
+    pub titlebar: Titlebar,
     pub insert_hint: InsertHint,
+    pub edge_resize: EdgeResize,
     pub preset_column_widths: Vec<PresetSize>,
     pub default_column_width: Option<PresetSize>,
     pub preset_window_heights: Vec<PresetSize>,
     pub center_focused_column: CenterFocusedColumn,
     pub always_center_single_column: bool,
     pub empty_workspace_above_first: bool,
+    /// Switching to the next or previous preset width stops at the last or first one instead of
+    /// wrapping around (`preset-widths-no-wrap`).
+    pub preset_widths_no_wrap: bool,
+    /// The same for preset window heights (`preset-heights-no-wrap`).
+    pub preset_heights_no_wrap: bool,
+    /// New windows that open in the scrolling layout open maximized to the edges
+    /// (`open-maximized-to-edges`); floating windows and dialogs are left alone, and the
+    /// `open-maximized-to-edges` window rule overrides it either way.
+    pub open_maximized_to_edges: bool,
     pub default_column_display: ColumnDisplay,
     pub gaps: f64,
     pub struts: Struts,
@@ -33,7 +46,9 @@ impl Default for Layout {
             border: Border::default(),
             shadow: Shadow::default(),
             tab_indicator: TabIndicator::default(),
+            titlebar: Titlebar::default(),
             insert_hint: InsertHint::default(),
+            edge_resize: EdgeResize::default(),
             preset_column_widths: vec![
                 PresetSize::Proportion(1. / 3.),
                 PresetSize::Proportion(0.5),
@@ -43,6 +58,9 @@ impl Default for Layout {
             center_focused_column: CenterFocusedColumn::Never,
             always_center_single_column: false,
             empty_workspace_above_first: false,
+            preset_widths_no_wrap: false,
+            preset_heights_no_wrap: false,
+            open_maximized_to_edges: false,
             default_column_display: ColumnDisplay::Normal,
             gaps: 16.,
             struts: Struts::default(),
@@ -64,9 +82,14 @@ impl MergeWith<LayoutPart> for Layout {
             border,
             shadow,
             tab_indicator,
+            titlebar,
             insert_hint,
+            edge_resize,
             always_center_single_column,
             empty_workspace_above_first,
+            preset_widths_no_wrap,
+            preset_heights_no_wrap,
+            open_maximized_to_edges,
             gaps,
         );
 
@@ -105,7 +128,11 @@ pub struct LayoutPart {
     #[knuffel(child)]
     pub tab_indicator: Option<TabIndicatorPart>,
     #[knuffel(child)]
+    pub titlebar: Option<TitlebarRule>,
+    #[knuffel(child)]
     pub insert_hint: Option<InsertHintPart>,
+    #[knuffel(child)]
+    pub edge_resize: Option<EdgeResizePart>,
     #[knuffel(child, unwrap(children))]
     pub preset_column_widths: Option<Vec<PresetSize>>,
     #[knuffel(child)]
@@ -118,6 +145,12 @@ pub struct LayoutPart {
     pub always_center_single_column: Option<Flag>,
     #[knuffel(child)]
     pub empty_workspace_above_first: Option<Flag>,
+    #[knuffel(child)]
+    pub preset_widths_no_wrap: Option<Flag>,
+    #[knuffel(child)]
+    pub preset_heights_no_wrap: Option<Flag>,
+    #[knuffel(child)]
+    pub open_maximized_to_edges: Option<Flag>,
     #[knuffel(child, unwrap(argument, str))]
     pub default_column_display: Option<ColumnDisplay>,
     #[knuffel(child, unwrap(argument))]
@@ -126,6 +159,51 @@ pub struct LayoutPart {
     pub struts: Option<Struts>,
     #[knuffel(child)]
     pub background_color: Option<Color>,
+}
+
+/// Resizing windows by dragging their edges: the band from `outside` beyond a window's edge to
+/// `inside` past its border, and `corner` along each edge from a corner for both edges.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeResize {
+    pub off: bool,
+    pub outside: f64,
+    pub inside: f64,
+    pub corner: f64,
+}
+
+impl Default for EdgeResize {
+    fn default() -> Self {
+        Self {
+            off: false,
+            outside: 12.,
+            inside: 4.,
+            corner: 28.,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct EdgeResizePart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub outside: Option<FloatOrInt<0, 1024>>,
+    #[knuffel(child, unwrap(argument))]
+    pub inside: Option<FloatOrInt<0, 1024>>,
+    #[knuffel(child, unwrap(argument))]
+    pub corner: Option<FloatOrInt<0, 1024>>,
+}
+
+impl MergeWith<EdgeResizePart> for EdgeResize {
+    fn merge_with(&mut self, part: &EdgeResizePart) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+        merge!((self, part), outside, inside, corner);
+    }
 }
 
 #[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]

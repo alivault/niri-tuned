@@ -340,3 +340,97 @@ impl Blur {
         Ok(self.textures[0].clone())
     }
 }
+
+/// The smallest Kawase offset for a pass count; the largest is twice it, where one more pass
+/// at the smallest offset blurs as far.
+const RAMP_MIN_OFFSET: f64 = 1.5;
+const RAMP_MAX_PASSES: u8 = 8;
+
+/// A blur that grows continuously to `radius` (physical pixels, roughly how far it spreads):
+/// the options to blur with and the alpha to draw the blur at.
+///
+/// Dual Kawase spreads about `offset × 2^passes`. The pass count is the largest whose
+/// smallest offset doesn't overshoot, and the offset makes up the rest, so the spread
+/// never jumps where a pass is added. Below the smallest blur one pass can make (it
+/// halves the resolution), that blur fades in over the sharp image instead. `None`: no
+/// blur at all.
+pub fn ramped_blur(radius: f64) -> Option<(BlurOptions, f32)> {
+    if !(radius > 0.) {
+        return None;
+    }
+
+    let smallest = RAMP_MIN_OFFSET * 2.;
+    if radius < smallest {
+        let options = BlurOptions {
+            passes: 1,
+            offset: RAMP_MIN_OFFSET,
+        };
+        return Some((options, (radius / smallest) as f32));
+    }
+
+    let passes = (radius / RAMP_MIN_OFFSET)
+        .log2()
+        .floor()
+        .clamp(1., f64::from(RAMP_MAX_PASSES));
+    let offset = radius / passes.exp2();
+    let options = BlurOptions {
+        passes: passes as u8,
+        offset,
+    };
+    Some((options, 1.))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spread(options: BlurOptions) -> f64 {
+        options.offset * f64::from(options.passes).exp2()
+    }
+
+    #[test]
+    fn ramped_blur_starts_sharp() {
+        assert!(ramped_blur(0.).is_none());
+        assert!(ramped_blur(-1.).is_none());
+        assert!(ramped_blur(f64::NAN).is_none());
+
+        let (options, alpha) = ramped_blur(0.3).unwrap();
+        assert_eq!(options.passes, 1);
+        assert!(alpha > 0. && alpha < 0.2);
+    }
+
+    #[test]
+    fn ramped_blur_grows_without_jumps() {
+        let mut last_spread = 0.;
+        let mut last_alpha = 0.;
+        let mut radius = 0.01;
+        while radius < 400. {
+            let (options, alpha) = ramped_blur(radius).unwrap();
+            assert!(alpha >= last_alpha, "alpha fell at {radius}");
+            if alpha == 1. {
+                let s = spread(options);
+                assert!((s - radius).abs() < 1e-6, "spread {s} for radius {radius}");
+                assert!(s >= last_spread);
+                assert!(
+                    options.passes == RAMP_MAX_PASSES
+                        || (RAMP_MIN_OFFSET - 1e-9..2. * RAMP_MIN_OFFSET + 1e-9)
+                            .contains(&options.offset),
+                    "offset {} out of range at {radius}",
+                    options.offset
+                );
+                last_spread = s;
+            }
+            last_alpha = alpha;
+            radius *= 1.01;
+        }
+    }
+
+    #[test]
+    fn ramped_blur_adds_a_pass_at_the_same_spread() {
+        let edge = RAMP_MIN_OFFSET * 8.;
+        let (below, _) = ramped_blur(edge - 1e-9).unwrap();
+        let (at, _) = ramped_blur(edge).unwrap();
+        assert_eq!(below.passes + 1, at.passes);
+        assert!((spread(below) - spread(at)).abs() < 1e-6);
+    }
+}

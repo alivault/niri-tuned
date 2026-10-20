@@ -11,6 +11,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use crate::niri::Niri;
 use crate::utils::id::IdCounter;
 
+pub mod nightlight;
 pub mod tty;
 pub use tty::Tty;
 

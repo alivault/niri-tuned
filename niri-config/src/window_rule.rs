@@ -2,7 +2,7 @@ use niri_ipc::ColumnDisplay;
 
 use crate::appearance::{
     BackgroundEffect, BackgroundEffectRule, BlockOutFrom, BorderRule, CornerRadius, ShadowRule,
-    TabIndicatorRule,
+    TabIndicatorRule, TitlebarRule,
 };
 use crate::layout::DefaultPresetSize;
 use crate::utils::{MergeWith, RegexEq};
@@ -10,6 +10,16 @@ use crate::FloatOrInt;
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct WindowRule {
+    /// `window-rule "name" { ... }`: a later rule with the same name changes this one where it
+    /// stands (it is placed right after it, for its windows unless it has matches of its own):
+    /// defaults in one file, changes in another, as an editor's settings.
+    #[knuffel(argument)]
+    pub name: Option<String>,
+    /// `off`: the rule does nothing; on a named rule, every earlier rule of that name is
+    /// switched off too, so an included default can be turned off without being edited.
+    #[knuffel(child)]
+    pub off: bool,
+
     #[knuffel(children(name = "match"))]
     pub matches: Vec<Match>,
     #[knuffel(children(name = "exclude"))]
@@ -53,6 +63,8 @@ pub struct WindowRule {
     pub shadow: ShadowRule,
     #[knuffel(child, default)]
     pub tab_indicator: TabIndicatorRule,
+    #[knuffel(child, default)]
+    pub titlebar: TitlebarRule,
     #[knuffel(child, unwrap(argument))]
     pub draw_border_with_background: Option<bool>,
     #[knuffel(child, unwrap(argument))]

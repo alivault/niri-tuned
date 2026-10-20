@@ -11,6 +11,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
 use super::shadow::Shadow;
+use super::titlebar::{Titlebar, TitlebarPart, TitlebarRenderElement, TitlebarState};
 use super::{
     HitType, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
     SizeFrac, RESIZE_ANIMATION_THRESHOLD,
@@ -32,8 +33,51 @@ use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
-    baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1,
+    baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1, ResizeEdge,
 };
+
+/// The edges of a `size` rectangle whose resize band `p` is in: from `margin` outside to `inset`
+/// inside; within `corner` of a corner along either edge, both of its edges.
+pub fn edge_resize_edges(
+    size: Size<f64, Logical>,
+    inset: f64,
+    margin: f64,
+    corner: f64,
+    p: Point<f64, Logical>,
+) -> Option<ResizeEdge> {
+    let outer = Rectangle::new(
+        Point::from((-margin, -margin)),
+        Size::from((size.w + margin * 2., size.h + margin * 2.)),
+    );
+    if !outer.contains(p) {
+        return None;
+    }
+
+    let near = |v: f64, len: f64, band: f64| (v < band, v > len - band);
+    let (left, right) = near(p.x, size.w, inset);
+    let (top, bottom) = near(p.y, size.h, inset);
+    if !(left || right || top || bottom) {
+        return None;
+    }
+
+    // Along an edge, close to a corner: the corner.
+    let (corner_left, corner_right) = near(p.x, size.w, corner);
+    let (corner_top, corner_bottom) = near(p.y, size.h, corner);
+    let mut edges = ResizeEdge::empty();
+    if left || ((top || bottom) && corner_left) {
+        edges |= ResizeEdge::LEFT;
+    }
+    if right || ((top || bottom) && corner_right) {
+        edges |= ResizeEdge::RIGHT;
+    }
+    if top || ((left || right) && corner_top) {
+        edges |= ResizeEdge::TOP;
+    }
+    if bottom || ((left || right) && corner_bottom) {
+        edges |= ResizeEdge::BOTTOM;
+    }
+    Some(edges)
+}
 
 /// Toplevel window with decorations.
 #[derive(Debug)]
@@ -46,6 +90,9 @@ pub struct Tile<W: LayoutElement> {
 
     /// The focus ring around the window.
     focus_ring: FocusRing,
+
+    /// The server-side title bar above the window, inside the border.
+    titlebar: Titlebar,
 
     /// The shadow around the window.
     shadow: Shadow,
@@ -124,6 +171,7 @@ niri_render_elements! {
     TileRenderElement<R> => {
         LayoutElement = LayoutElementRenderElement<R>,
         FocusRing = FocusRingRenderElement,
+        Titlebar = TitlebarRenderElement,
         SolidColor = SolidColorRenderElement,
         Opening = OpeningWindowRenderElement,
         Resize = ResizeRenderElement,
@@ -186,12 +234,15 @@ impl<W: LayoutElement> Tile<W> {
         let border_config = options.layout.border.merged_with(&rules.border);
         let focus_ring_config = options.layout.focus_ring.merged_with(&rules.focus_ring);
         let shadow_config = options.layout.shadow.merged_with(&rules.shadow);
+        let mut titlebar_config = options.layout.titlebar.clone().merged_with(&rules.titlebar);
+        titlebar_config.height = round_logical_in_physical(scale, titlebar_config.height);
         let sizing_mode = window.sizing_mode();
 
         Self {
             window,
             border: FocusRing::new(border_config.into()),
             focus_ring: FocusRing::new(focus_ring_config),
+            titlebar: Titlebar::new(titlebar_config),
             shadow: Shadow::new(shadow_config),
             sizing_mode,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
@@ -252,12 +303,22 @@ impl<W: LayoutElement> Tile<W> {
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
         self.shadow.update_config(shadow_config);
 
+        let mut titlebar_config = self
+            .options
+            .layout
+            .titlebar
+            .clone()
+            .merged_with(&rules.titlebar);
+        titlebar_config.height = round_logical_in_physical(self.scale, titlebar_config.height);
+        self.titlebar.update_config(titlebar_config);
+
         self.window.update_config(self.options.blur);
     }
 
     pub fn update_shaders(&mut self) {
         self.border.update_shaders();
         self.focus_ring.update_shaders();
+        self.titlebar.update_shaders();
         self.shadow.update_shaders();
     }
 
@@ -282,10 +343,13 @@ impl<W: LayoutElement> Tile<W> {
                 if prev_sizing_mode.is_fullscreen() {
                     tile_size.w = f64::max(tile_size.w, self.view_size.w);
                     tile_size.h = f64::max(tile_size.h, self.view_size.h);
-                } else if prev_sizing_mode.is_normal() && !self.border.is_off() {
-                    let width = self.border.width();
-                    tile_size.w += width * 2.;
-                    tile_size.h += width * 2.;
+                } else {
+                    if prev_sizing_mode.is_normal() && !self.border.is_off() {
+                        let width = self.border.width();
+                        tile_size.w += width * 2.;
+                        tile_size.h += width * 2.;
+                    }
+                    tile_size.h += self.titlebar_height();
                 }
 
                 tile_size.w = tile_size_from.w + (tile_size.w - tile_size_from.w) * val;
@@ -321,10 +385,13 @@ impl<W: LayoutElement> Tile<W> {
                 if prev_sizing_mode.is_fullscreen() {
                     tile_size.w = f64::max(tile_size.w, self.view_size.w);
                     tile_size.h = f64::max(tile_size.h, self.view_size.h);
-                } else if prev_sizing_mode.is_normal() && !self.border.is_off() {
-                    let width = self.border.width();
-                    tile_size.w += width * 2.;
-                    tile_size.h += width * 2.;
+                } else {
+                    if prev_sizing_mode.is_normal() && !self.border.is_off() {
+                        let width = self.border.width();
+                        tile_size.w += width * 2.;
+                        tile_size.h += width * 2.;
+                    }
+                    tile_size.h += self.titlebar_height();
                 }
 
                 let fullscreen_from = if prev_sizing_mode.is_fullscreen() {
@@ -402,11 +469,24 @@ impl<W: LayoutElement> Tile<W> {
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
         self.shadow.update_config(shadow_config);
 
+        let mut titlebar_config = self
+            .options
+            .layout
+            .titlebar
+            .clone()
+            .merged_with(&rules.titlebar);
+        titlebar_config.height = round_logical_in_physical(self.scale, titlebar_config.height);
+        self.titlebar.update_config(titlebar_config);
+
         let window_size = self.window_size();
-        let radius = self
+        let mut radius = self
             .window
             .geometry_corner_radius()
             .fit_to(window_size.w as f32, window_size.h as f32);
+        if self.titlebar_height() > 0. {
+            radius.top_left = 0.;
+            radius.top_right = 0.;
+        }
         self.rounded_corner_damage.set_corner_radius(radius);
     }
 
@@ -503,6 +583,29 @@ impl<W: LayoutElement> Tile<W> {
             self.scale,
             1. - expanded_progress as f32,
         );
+
+        if let Some(rect) = self.titlebar_rect() {
+            let size = Size::from((border_window_size.w, rect.size.h));
+            let window_radius = self
+                .window
+                .geometry_corner_radius()
+                .scaled_by(1. - expanded_progress as f32);
+            let title = self.window.title().unwrap_or_default();
+            let state = TitlebarState {
+                floating: self.window.is_floating(),
+                maximized: self.sizing_mode.is_maximized(),
+                fullscreen: self.sizing_mode.is_fullscreen(),
+            };
+            self.titlebar.update_render_elements(
+                size,
+                is_active,
+                state,
+                &title,
+                window_radius,
+                self.scale,
+                1.,
+            );
+        }
 
         let radius = if self.visual_border_width().is_some() {
             radius
@@ -736,6 +839,85 @@ impl<W: LayoutElement> Tile<W> {
         Some(self.border.width())
     }
 
+    /// Height of the title bar this tile reserves outside fullscreen and maximize, or 0 for none.
+    ///
+    /// Only windows that agreed to server-side decorations get a title bar.
+    /// A transparent title bar reserves nothing: the window runs under it.
+    pub fn titlebar_height(&self) -> f64 {
+        if self.titlebar.is_transparent() {
+            return 0.;
+        }
+
+        self.titlebar_shown_height()
+    }
+
+    /// Height of the title bar drawn on this tile (reserved or over the window), or 0 for none.
+    fn titlebar_shown_height(&self) -> f64 {
+        if self.titlebar.is_off() || !self.window.has_ssd() {
+            return 0.;
+        }
+
+        self.titlebar.height()
+    }
+
+    /// The title bar stays on maximized windows; only fullscreen hides it.
+    fn effective_titlebar_height(&self) -> f64 {
+        if self.sizing_mode.is_fullscreen() {
+            return 0.;
+        }
+
+        self.titlebar_height()
+    }
+
+    fn visual_titlebar_height(&self) -> f64 {
+        // Like the border: hidden only once fully fullscreen.
+        if self.fullscreen_progress() == 1. {
+            return 0.;
+        }
+
+        self.titlebar_height()
+    }
+
+    /// The title bar's rectangle within this tile, if it is shown.
+    fn titlebar_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        let height = self.titlebar_shown_height();
+        // A transparent bar stays in fullscreen: its app's toolbar does, and holds the buttons.
+        if height <= 0. || (self.fullscreen_progress() == 1. && !self.titlebar.is_transparent()) {
+            return None;
+        }
+
+        let border_width = self.visual_border_width().unwrap_or(0.);
+        let tile_size = self.animated_tile_size();
+        Some(Rectangle::new(
+            Point::from((border_width, border_width)),
+            Size::from((tile_size.w - border_width * 2., height)),
+        ))
+    }
+
+    /// The edges whose band `point` (relative to the tile) is in, for resizing by dragging an
+    /// edge (layout.edge-resize): from `outside` beyond the tile to `inside` past its border,
+    /// longer at the corners. `None` when the tile can't be resized so (maximized, fullscreen)
+    /// or the point is elsewhere.
+    pub fn edge_resize_edges(&self, point: Point<f64, Logical>) -> Option<ResizeEdge> {
+        let config = self.options.layout.edge_resize;
+        if config.off || !self.sizing_mode.is_normal() {
+            return None;
+        }
+        let inset = self.effective_border_width().unwrap_or(0.) + config.inside;
+        edge_resize_edges(
+            self.tile_size(),
+            inset,
+            config.outside,
+            config.corner,
+            point,
+        )
+    }
+
+    /// Sets the hovered title bar button; returns whether it changed.
+    pub fn set_titlebar_hovered(&mut self, part: Option<TitlebarPart>) -> bool {
+        self.titlebar.set_hovered(part)
+    }
+
     /// Returns the location of the window's visual geometry within this Tile.
     pub fn window_loc(&self) -> Point<f64, Logical> {
         let mut loc = Point::from((0., 0.));
@@ -751,8 +933,11 @@ impl<W: LayoutElement> Tile<W> {
         //   the tile size matches the window.
         // - During animations, the window remains centered within the tile; this is important for
         //   the to/from fullscreen animation.
+        //
+        // A title bar takes the top of the tile; the window is centred in the rest.
+        let titlebar_height = self.visual_titlebar_height();
         loc.x += (target_size.w - window_size.w) / 2.;
-        loc.y += (target_size.h - window_size.h) / 2.;
+        loc.y += titlebar_height + (target_size.h - titlebar_height - window_size.h) / 2.;
 
         // Round to physical pixels.
         loc = loc
@@ -777,6 +962,7 @@ impl<W: LayoutElement> Tile<W> {
             size.w += width * 2.;
             size.h += width * 2.;
         }
+        size.h += self.effective_titlebar_height();
 
         size
     }
@@ -796,6 +982,7 @@ impl<W: LayoutElement> Tile<W> {
             size.w += width * 2.;
             size.h += width * 2.;
         }
+        size.h += self.effective_titlebar_height();
 
         size
     }
@@ -885,12 +1072,38 @@ impl<W: LayoutElement> Tile<W> {
         let offset = self.bob_offset();
         let point = point - offset;
 
-        if self.is_in_input_region(point) {
+        let titlebar = self
+            .titlebar_rect()
+            .and_then(|rect| self.titlebar.hit(rect.size, point - rect.loc));
+        // Over a transparent bar the buttons are niri's and the rest is the window's.
+        let over_window = !matches!(titlebar, Some(part) if part != TitlebarPart::Bar)
+            || !self.titlebar.is_transparent();
+
+        // The edge's resize band inside the tile is niri's too (layout.edge-resize), under the
+        // title bar's buttons.
+        let on_button = matches!(titlebar, Some(TitlebarPart::Button(_)));
+        if !on_button
+            && self.is_in_activation_region(point)
+            && self.edge_resize_edges(point).is_some()
+        {
+            return Some(HitType::Activate {
+                is_tab_indicator: false,
+                titlebar: None,
+            });
+        }
+
+        if over_window && self.is_in_input_region(point) {
             let win_pos = self.buf_loc() + offset;
             Some(HitType::Input { win_pos })
+        } else if let Some(part) = titlebar {
+            Some(HitType::Activate {
+                is_tab_indicator: false,
+                titlebar: Some(part),
+            })
         } else if self.is_in_activation_region(point) {
             Some(HitType::Activate {
                 is_tab_indicator: false,
+                titlebar: None,
             })
         } else {
             None
@@ -909,6 +1122,7 @@ impl<W: LayoutElement> Tile<W> {
             size.w = f64::max(1., size.w - width * 2.);
             size.h = f64::max(1., size.h - width * 2.);
         }
+        size.h = f64::max(1., size.h - self.titlebar_height());
 
         // The size request has to be i32 unfortunately, due to Wayland. We floor here instead of
         // round to avoid situations where proportionally-sized columns don't fit on the screen
@@ -930,6 +1144,7 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn tile_height_for_window_height(&self, size: f64) -> f64 {
+        let size = size + self.titlebar_height();
         if self.border.is_off() {
             size
         } else {
@@ -946,6 +1161,7 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn window_height_for_tile_height(&self, size: f64) -> f64 {
+        let size = size - self.titlebar_height();
         if self.border.is_off() {
             size
         } else {
@@ -955,10 +1171,11 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn request_maximized(
         &mut self,
-        size: Size<f64, Logical>,
+        mut size: Size<f64, Logical>,
         animate: bool,
         transaction: Option<Transaction>,
     ) {
+        size.h = f64::max(1., size.h - self.titlebar_height());
         self.window.request_size(
             size.to_i32_round(),
             SizingMode::Maximized,
@@ -989,6 +1206,10 @@ impl<W: LayoutElement> Tile<W> {
             size.w += width * 2.;
             size.h += width * 2.;
         }
+        let titlebar_height = self.titlebar_height();
+        if titlebar_height > 0. {
+            size.h = f64::max(1., size.h) + titlebar_height;
+        }
 
         size
     }
@@ -1006,6 +1227,9 @@ impl<W: LayoutElement> Tile<W> {
             if size.h > 0. {
                 size.h += width * 2.;
             }
+        }
+        if size.h > 0. {
+            size.h += self.titlebar_height();
         }
 
         size
@@ -1069,10 +1293,16 @@ impl<W: LayoutElement> Tile<W> {
         // Clip to geometry including during the fullscreen animation to help with buggy clients
         // that submit a full-sized buffer before acking the fullscreen state (Firefox).
         let clip_to_geometry = fullscreen_progress < 1. && rules.clip_to_geometry == Some(true);
-        let radius = self
+        let mut radius = self
             .window
             .geometry_corner_radius()
             .scaled_by(1. - expanded_progress as f32);
+        // A title bar above the window meets its top edge, so those corners are square.
+        let titlebar_rect = self.titlebar_rect();
+        if self.visual_titlebar_height() > 0. {
+            radius.top_left = 0.;
+            radius.top_right = 0.;
+        }
 
         // Popups go on top, whether it's resize or not.
         self.window.render_popups(
@@ -1083,6 +1313,14 @@ impl<W: LayoutElement> Tile<W> {
             xray_pos,
             &mut |elem| push(elem.into()),
         );
+
+        // Above the window: a transparent title bar's buttons are drawn over it.
+        if let Some(rect) = titlebar_rect {
+            self.titlebar
+                .render(ctx.renderer, location + rect.loc, &mut |elem| {
+                    push(elem.into())
+                });
+        }
 
         // If we're resizing, try to render a shader, or a fallback.
         let mut pushed_resize = false;
@@ -1170,8 +1408,35 @@ impl<W: LayoutElement> Tile<W> {
             let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
 
             let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
+            // Zoomed out (overview): integrate each destination pixel's source footprint like
+            // the recent-windows thumbnails, instead of one bilinear sample that aliases.
+            let zoom = xray_pos.zoom;
+            let thumbnail_shader = if zoom < 1. {
+                ClippedSurfaceRenderElement::thumbnail_shader(ctx.renderer).cloned()
+            } else {
+                None
+            };
             let clip = |elem| match elem {
                 LayoutElementRenderElement::Wayland(elem) => {
+                    if let Some(shader) = thumbnail_shader.clone() {
+                        // Without clip-to-geometry, "clip" to the surface itself (no-op).
+                        let (clip_geo, clip_radius) = if clip_to_geometry {
+                            (geo, radius)
+                        } else {
+                            let own = elem.geometry(scale).to_f64().to_logical(scale);
+                            (own, CornerRadius::default())
+                        };
+                        return ClippedSurfaceRenderElement::new(
+                            elem,
+                            scale,
+                            clip_geo,
+                            shader,
+                            clip_radius,
+                        )
+                        .with_thumbnail_filter(zoom)
+                        .into();
+                    }
+
                     // If we should clip to geometry, render a clipped window.
                     if clip_to_geometry {
                         if let Some(shader) = clip_shader.clone() {
@@ -1301,6 +1566,15 @@ impl<W: LayoutElement> Tile<W> {
                 .render(ctx.renderer, location, &mut |elem| push(elem.into()));
         }
 
+        // Behind a title bar above the window too, so a see-through bar (a translucent
+        // terminal's) is blurred like the window under it.
+        let above = (self.visual_titlebar_height() > 0.).then(|| {
+            let radius = self
+                .window
+                .geometry_corner_radius()
+                .scaled_by(1. - expanded_progress as f32);
+            (self.visual_titlebar_height(), radius)
+        });
         let surface_anim_scale = animated_window_size / window_size;
         self.window.render_background_effect(
             ctx.as_gles(),
@@ -1310,6 +1584,7 @@ impl<W: LayoutElement> Tile<W> {
             surface_anim_scale,
             radius,
             xray_pos,
+            above,
             &mut |elem| push(elem.into()),
         );
     }

@@ -225,6 +225,20 @@ layout {
 > This is a bit [unclearly defined](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/issues/155) in the Wayland protocol, so some clients may misinterpret it.
 > Either way, `default-column-width {}` is most useful for specific windows, in form of a [window rule](./Configuration:-Window-Rules.md#default-column-width) with the same syntax.
 
+### `open-maximized-to-edges`
+
+New windows that open in the scrolling layout open maximized to the edges, as if each had the `open-maximized-to-edges true` [window rule](./Configuration:-Window-Rules.md#open-maximized-to-edges).
+Unmaximizing one gives it `default-column-width`.
+
+Floating windows are left alone: dialogs, and windows with an `open-floating true` rule, open floating at their normal size.
+The `open-maximized-to-edges` window rule overrides this either way, and so does a window asking to be unmaximized before it shows.
+
+```kdl
+layout {
+    open-maximized-to-edges
+}
+```
+
 ### `preset-window-heights`
 
 <sup>Since: 0.1.9</sup>
@@ -407,7 +421,24 @@ These will also remove client-side shadows if the window draws any.
 
 `color` is the shadow color and opacity.
 
-`inactive-color` lets you override the shadow color for inactive windows; by default, a more transparent `color` is used.
+`inactive-color` lets you override the shadow color for inactive windows; by default, `color` is used.
+
+<sup>Tuned build</sup> `inactive-softness`, `inactive-spread` and `inactive-offset` give inactive windows a shadow of their own size and place too; each unset one is the active window's.
+They also work in a window rule's `shadow` block.
+
+```kdl
+layout {
+    shadow {
+        on
+        softness 30
+        offset x=0 y=8
+        // Windows you aren't using: a smaller, closer shadow.
+        inactive-softness 12
+        inactive-offset x=0 y=3
+        inactive-color "#00000030"
+    }
+}
+```
 
 Shadow drawing will follow the window corner radius set with the [`geometry-corner-radius` window rule](./Configuration:-Window-Rules.md#geometry-corner-radius).
 
@@ -478,6 +509,126 @@ layout {
         length total-proportion=1.0
         position "top"
         place-within-column
+    }
+}
+```
+
+### `titlebar`
+
+<sup>niri-tuned</sup>
+
+A title bar that niri draws above every window using server-side decorations, the way it draws the border: inside the border, with the window's title in the middle and its buttons on one side (the left by default): close, and a square that toggles the column's full width.
+
+Only windows that agreed to server-side decorations get one (see [`prefer-no-csd`](./Configuration:-Miscellaneous.md#prefer-no-csd)), so a window never has two title bars.
+The bar stays on maximized windows and hides in fullscreen.
+
+Clicking the bar focuses the window and dragging it moves the window, as a client-side title bar does; double-clicking it toggles the column's full width.
+The buttons sit on grey circles, brightening on hover and close's turning red (`button-highlight "hover"` shows the circles only on hover); they act on release over the same button; a toggle's icon shows what a click will undo (float shows the columns while floating, maximize the inward arrows while maximized).
+
+- `close` closes the window.
+- `zoom` goes between floating and maximized: on a floating (or tiled) window it shows a plus and maximizes the window in the columns; on a maximized one it shows cards and floats the window. Alt-click toggles fullscreen, and in fullscreen any click leaves it.
+- `float` toggles floating.
+- `maximize` toggles maximized to the edges; Alt-click toggles fullscreen, and in fullscreen any click leaves it.
+- `maximize-column` (the square) toggles the column's full width.
+- `fullscreen` toggles fullscreen.
+
+```kdl
+layout {
+    titlebar {
+        // off
+        on
+        height 30
+        font "sans Medium 12px"
+        active-color "#2c2c2e"
+        inactive-color "#1c1c1e"
+        active-text-color "#f2f2f7"
+        inactive-text-color "#8e8e93"
+        button-color "#ffffff26"
+        // button-inactive-color "#ffffff12"
+        // button-hover-color "#ffffff40"
+        // button-icon-color "#f2f2f7"
+        // button-icon-inactive-color "#8e8e93"
+        // button-icon-hover-color "#ffffff"
+        close-hover-color "#ff453a"
+        button-hover-text-color "#ffffff"
+        // button-styles {
+        //     close { hover-color "#ff5f57"; icon-hover-color "#4d0000"; }
+        //     maximize-column { hover-color "#28c840"; }
+        // }
+        button-highlight "always"
+        close-red "hover"
+        // button-hover-group
+        button-size 30
+        button-circle 22
+        icon-size 15
+        button-edge-gap 4
+        title-gap 8
+        button-hover-brighten 0.14
+        buttons-position "left"
+        buttons "close" "maximize-column"
+        icons {
+            close "x"
+            maximize-column "square"
+            // zoom "plus"
+            // zoom-active "cards"
+            // float "cards"
+            // float-active "square-split-horizontal"
+            // maximize-active "minus"
+            // fullscreen "~/.config/niri/icons/expand.svg"
+        }
+    }
+}
+```
+
+Colours may be see-through (`"#1e1e1ee6"`): a window rule giving a translucent terminal's bar its background at the terminal's opacity makes them one pane of glass, and a window rule's [`background-effect`](./Configuration:-Window-Rules.md) blur covers the bar as well as the window (unless the app sets its own blur region).
+
+
+Title bars are off by default.
+`height` is in logical pixels; the bar's top corners follow the window's [`geometry-corner-radius`](./Configuration:-Window-Rules.md#geometry-corner-radius), and the window's top corners become square under it.
+`font` is a Pango font description.
+Each button takes a `button-size` square, centred on the bar's height, with its `button-circle` and its `icon-size` icon in the middle; `button-edge-gap` separates the outermost button from the bar's edge and `title-gap` the title from the buttons.
+The buttons' colours: `button-color` (circles; `button-inactive-color` on unfocused windows, `button-hover-color` under the pointer, else lightened by `button-hover-brighten`), `button-icon-color`, `button-icon-inactive-color` and `button-icon-hover-color` (icons; unset, the title's colours), and close's red `close-hover-color` with its icon `button-hover-text-color`.
+`button-styles` gives each button (`close`, `maximize-column`, `zoom`, `float`, `maximize`, `fullscreen`) its own `color`, `inactive-color`, `hover-color`, `icon-color`, `icon-inactive-color` and `icon-hover-color`, over all of those.
+`close-red` is when close's circle is red: `"hover"`, `"focused"` (on the focused window) or `"always"`; `button-hover-brighten` is how much white hover lays over an always-shown circle.
+`button-hover-group` shows every button's hover icon while the pointer is on any of them, as macOS's traffic lights do (with `icon-color "#00000000"` in `button-styles`, the icons appear only then); each circle still follows its own hover.
+`buttons-position` is `"left"` (the default, as on the Mac) or `"right"`; `buttons` lists the buttons from that edge inwards.
+
+`icons` sets each button's icon: `close`, `zoom`, `float`, `maximize`, `maximize-column` and `fullscreen`, and `zoom-active`, `float-active`, `maximize-active` and `fullscreen-active` for while the toggle is on (maximized or fullscreen for zoom and maximize, floating, fullscreen; unset, the built-in one, or the plain icon when that is set).
+An icon is one of the built-in Phosphor icons (`x`, `square`, `cards`, `square-split-horizontal`, `plus`, `minus`, `arrows-out-simple`, `arrows-in-simple`, `corners-out`, `corners-in`, `arrows-out-line-horizontal`) or an SVG file (`~/...` or an absolute path), such as any Phosphor or Lucide icon: its paths, lines, polylines, polygons, rects and circles are filled, or stroked when the SVG has `fill="none"` (at its `stroke-width`), fitted to the button.
+Files are read when the config (re)loads.
+
+`unified` (a unified toolbar, as macOS calls it; usually in a window rule, for apps that paint their own top area; `transparent` is its old name) runs the window's content under the bar and draws only the buttons, centred on `height`: the app's sidebar can run to the top and its toolbar becomes the bar's row, as with macOS's full-size content view.
+Clicks on the buttons are niri's; everywhere else they go to the window, which moves itself by asking for an interactive move from its toolbar.
+The bar's background and the title are not drawn, and the buttons stay in fullscreen, where the app's toolbar stays too.
+
+```kdl
+window-rule {
+    match app-id="^files$"
+
+    titlebar {
+        unified
+        height 52
+    }
+}
+```
+
+### `edge-resize`
+
+<sup>niri-tuned</sup>
+
+Windows resize by dragging their edges, as on macOS: over a band from `outside` beyond a window's edge (in the gaps) to `inside` past its border, the cursor turns into a resize arrow, and a drag resizes like Mod with the right button.
+Within `corner` of a corner along either edge, both of its edges resize.
+The band inside the edge is taken from the window (as macOS does), except under title bar buttons.
+A side's double-click toggles the column's full width, the top's or bottom's resets the window height.
+Maximized and fullscreen windows have no edges to drag.
+
+```kdl
+layout {
+    edge-resize {
+        // off
+        outside 12
+        inside 4
+        corner 28
     }
 }
 ```

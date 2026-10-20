@@ -61,6 +61,7 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
+use super::nightlight::{Ctm, DrmCtmIo};
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
@@ -100,6 +101,10 @@ pub struct Tty {
     // Whether the debug tinting is enabled.
     debug_tint: bool,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+    nightlight_owner: Option<u64>,
+    nightlight_desired: bool,
+    nightlight_registry: Rc<super::nightlight::Registry>,
+    nightlight_generation: u64,
 }
 
 pub type TtyRenderer<'render> = MultiRenderer<
@@ -376,6 +381,7 @@ struct Surface {
     connector: connector::Handle,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
+    nightlight: Result<Rc<RefCell<Ctm<DrmCtmIo>>>, String>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
     /// Tracy frame that goes from vblank to vblank.
@@ -414,12 +420,32 @@ impl Tty {
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("Tty::new");
 
-        let (session, notifier) = LibSeatSession::new().context(
+        let nightlight_registry = super::nightlight::Registry::new();
+        let cleanup = nightlight_registry.clone();
+        let (session, notifier) = LibSeatSession::new_with_pre_disable(move || {
+            cleanup.pre_disable()
+        })
+        .context(
             "Error creating a session. This might mean that you're trying to run niri on a TTY \
              that is already busy, for example if you're running this inside tmux that had been \
              originally started on a different TTY",
         )?;
         let seat_name = session.seat();
+        nightlight_registry.access.set(session.is_active());
+        // Retry only safe, outstanding cleanup, never reacquire a temperature
+        // or touch an inactive/revoked seat from this timer.
+        event_loop
+            .insert_source(
+                Timer::from_duration(Duration::from_secs(3)),
+                |_, _, state| {
+                    if let Some(tty) = state.backend.tty_checked() {
+                        tty.nightlight_registry
+                            .retry_unacknowledged(tty.session.is_active(), tty.nightlight_desired);
+                    }
+                    TimeoutAction::ToDuration(Duration::from_secs(3))
+                },
+            )
+            .map_err(|err| anyhow!("could not register CTM cleanup timer: {err}"))?;
 
         let udev_backend =
             UdevBackend::new(session.seat()).context("error creating a udev backend")?;
@@ -506,6 +532,10 @@ impl Tty {
             update_output_config_on_resume: false,
             debug_tint: false,
             ipc_outputs: Arc::new(Mutex::new(HashMap::new())),
+            nightlight_owner: None,
+            nightlight_desired: false,
+            nightlight_registry,
+            nightlight_generation: 0,
         })
     }
 
@@ -597,6 +627,8 @@ impl Tty {
                 self.libinput.suspend();
 
                 for device in self.devices.values_mut() {
+                    // CTM restoration already ran synchronously in libseat's
+                    // pre-disable hook, before either backend acknowledges.
                     device.drm.pause();
 
                     if let Some(lease_state) = &mut device.drm_lease_state {
@@ -606,6 +638,7 @@ impl Tty {
             }
             SessionEvent::ActivateSession => {
                 debug!("resuming session");
+                self.nightlight_registry.access.set(true);
 
                 if self.libinput.resume().is_err() {
                     warn!("error resuming libinput");
@@ -676,6 +709,17 @@ impl Tty {
                     // Apply pending gamma changes and restore our existing gamma.
                     let device = self.devices.get_mut(&node).unwrap();
                     for (crtc, surface) in device.surfaces.iter_mut() {
+                        if surface.nightlight.is_err() {
+                            surface.nightlight = self
+                                .nightlight_registry
+                                .track(
+                                    node.dev_id(),
+                                    &device.drm,
+                                    *crtc,
+                                    surface.name.connector.clone(),
+                                )
+                                .map_err(|err| format!("{err:#}"));
+                        }
                         if let Ok(props) =
                             ConnectorProperties::try_new(&device.drm, surface.connector)
                         {
@@ -728,6 +772,7 @@ impl Tty {
                 niri.notify_activity();
                 niri.monitors_active = true;
                 self.set_monitors_active(true);
+                self.reconcile_nightlight();
                 niri.queue_redraw_all();
             }
         }
@@ -1213,6 +1258,7 @@ impl Tty {
 
         self.refresh_ipc_outputs(niri);
 
+        self.nightlight_registry.forget_device(node.dev_id());
         drop(device);
 
         match TryInto::<OwnedFd>::try_into(device_fd) {
@@ -1321,6 +1367,15 @@ impl Tty {
         let mut gamma_props = GammaProps::new(&device.drm, crtc)
             .map_err(|err| debug!("couldn't get gamma properties: {err:?}"))
             .ok();
+        let nightlight = self
+            .nightlight_registry
+            .track(
+                node.dev_id(),
+                &device.drm,
+                crtc,
+                output_name.connector.clone(),
+            )
+            .map_err(|err| format!("{err:#}"));
 
         // Reset gamma in case it was set before.
         let res = if let Some(gamma_props) = &mut gamma_props {
@@ -1531,6 +1586,7 @@ impl Tty {
             compositor,
             dmabuf_feedback,
             gamma_props,
+            nightlight,
             pending_gamma_change: None,
             vblank_frame: None,
             vblank_frame_name,
@@ -1543,6 +1599,7 @@ impl Tty {
         assert!(res.is_none(), "crtc must not have already existed");
 
         niri.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
+        self.reconcile_nightlight();
 
         if niri.monitors_active {
             // Redraw the new monitor.
@@ -1602,6 +1659,8 @@ impl Tty {
         } else {
             error!("missing output for crtc {crtc:?}");
         };
+        drop(surface); // Restore removed output before reconciling survivors.
+        self.reconcile_nightlight();
     }
 
     fn on_vblank(
@@ -2080,6 +2139,117 @@ impl Tty {
                 .context("error getting crtc info")?;
             Ok(info.gamma_length())
         }
+    }
+
+    /// A separate, connection-leased CTM interface; gamma-control is unchanged.
+    pub fn nightlight_request(
+        &mut self,
+        client: u64,
+        enabled: Option<bool>,
+    ) -> anyhow::Result<niri_ipc::NightlightStatus> {
+        if let Some(enabled) = enabled {
+            ensure!(
+                self.session.is_active(),
+                "nightlight requires an active native DRM session"
+            );
+            ensure!(
+                self.nightlight_owner.is_none() || self.nightlight_owner == Some(client),
+                "nightlight is owned by another IPC connection"
+            );
+            // Reserve cleanup ownership BEFORE any write. Even a failed
+            // first enable can leave a dirty/partially warm output behind.
+            self.nightlight_owner = Some(client);
+            self.apply_nightlight(enabled)?;
+            self.nightlight_desired = enabled;
+            self.nightlight_owner = enabled.then_some(client);
+        }
+        Ok(self.nightlight_status())
+    }
+
+    fn apply_nightlight(&mut self, enabled: bool) -> anyhow::Result<()> {
+        self.nightlight_registry.restore(true);
+        ensure!(
+            !enabled || self.nightlight_registry.orphan_status().is_empty(),
+            "disconnected output CTM cleanup remains pending"
+        );
+        let mut guards = Vec::new();
+        for device in self.devices.values_mut() {
+            for surface in device.surfaces.values_mut() {
+                match &mut surface.nightlight {
+                    Ok(ctm) => guards.push(ctm.borrow_mut()),
+                    Err(error) if enabled => bail!("{}: {error}", surface.name.connector),
+                    Err(_) => (), // Off must still restore every supported output.
+                }
+            }
+        }
+        ensure!(!enabled || !guards.is_empty(), "no CTM-capable outputs");
+        let mut targets: Vec<_> = guards.iter_mut().map(|guard| &mut **guard).collect();
+        super::nightlight::transaction(&mut targets, enabled)?;
+        ensure!(
+            self.nightlight_registry.orphan_status().is_empty(),
+            "disconnected output CTM restoration remains unverified"
+        );
+        Ok(())
+    }
+
+    fn restore_nightlight(&mut self) {
+        // Cleanup is best-effort per output: one disconnected/revoked output
+        // must not prevent restoring the other owned displays.
+        self.nightlight_registry.restore(false);
+    }
+
+    fn reconcile_nightlight(&mut self) {
+        self.nightlight_generation = self.nightlight_generation.saturating_add(1);
+        if !self.session.is_active() {
+            return;
+        }
+        if self.nightlight_desired {
+            if let Err(err) = self.apply_nightlight(true) {
+                warn!("nightlight output reconciliation failed: {err:#}");
+                self.restore_nightlight();
+            }
+        } else {
+            self.restore_nightlight();
+        }
+    }
+
+    pub fn release_nightlight(&mut self, client: u64) {
+        if self.nightlight_owner != Some(client) {
+            return;
+        }
+        self.nightlight_desired = false;
+        self.nightlight_owner = None;
+        if self.session.is_active() {
+            self.restore_nightlight();
+        }
+    }
+
+    fn nightlight_status(&self) -> niri_ipc::NightlightStatus {
+        let active = self.session.is_active();
+        let mut outputs = self.nightlight_registry.orphan_status();
+        for device in self.devices.values() {
+            for surface in device.surfaces.values() {
+                outputs.push(match &surface.nightlight {
+                    Ok(ctm) => ctm
+                        .borrow()
+                        .output_status(surface.name.connector.clone(), active),
+                    Err(err) => niri_ipc::NightlightOutput {
+                        name: surface.name.connector.clone(),
+                        supported: false,
+                        enabled: None,
+                        cleanup_pending: false,
+                        calibration: None,
+                        error: err.clone(),
+                    },
+                });
+            }
+        }
+        super::nightlight::aggregate(
+            outputs,
+            self.nightlight_desired,
+            active,
+            self.nightlight_generation,
+        )
     }
 
     pub fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> anyhow::Result<()> {
@@ -2581,6 +2751,17 @@ impl Tty {
         }
 
         None
+    }
+}
+
+impl Drop for Tty {
+    fn drop(&mut self) {
+        // Explicitly restore BEFORE LibSeatSession is dropped/revokes master.
+        // Individual Ctm drop is also a fallback for connector/device removal.
+        if self.session.is_active() {
+            self.restore_nightlight();
+        }
+        self.nightlight_registry.access.set(false);
     }
 }
 

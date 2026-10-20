@@ -4,7 +4,7 @@ use niri_config::utils::MergeWith as _;
 use niri_config::window_rule::{Match, WindowRule};
 use niri_config::{
     BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
-    ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
+    ResolvedPopupsRules, ShadowRule, TabIndicatorRule, TitlebarRule,
 };
 use niri_ipc::ColumnDisplay;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -90,6 +90,8 @@ pub struct ResolvedWindowRules {
     pub shadow: ShadowRule,
     /// Tab indicator overrides.
     pub tab_indicator: TabIndicatorRule,
+    /// Title bar overrides.
+    pub titlebar: TitlebarRule,
 
     /// Whether or not to draw the border with a solid background.
     ///
@@ -195,6 +197,9 @@ impl ResolvedWindowRules {
             let mut open_on_workspace = None;
 
             for rule in rules {
+                if rule.off {
+                    continue;
+                }
                 let matches = |m: &Match| {
                     if let Some(at_startup) = m.at_startup {
                         if at_startup != is_at_startup {
@@ -274,6 +279,7 @@ impl ResolvedWindowRules {
                 resolved.border.merge_with(&rule.border);
                 resolved.shadow.merge_with(&rule.shadow);
                 resolved.tab_indicator.merge_with(&rule.tab_indicator);
+                resolved.titlebar.merge_with(&rule.titlebar);
 
                 if let Some(x) = rule.draw_border_with_background {
                     resolved.draw_border_with_background = Some(x);

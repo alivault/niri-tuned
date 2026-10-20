@@ -732,6 +732,7 @@ impl LayoutElement for Mapped {
                 effect,
                 false,
                 xray_pos,
+                None,
                 &mut |elem| push(elem.into()),
             );
         }
@@ -746,10 +747,11 @@ impl LayoutElement for Mapped {
         surface_anim_scale: Scale<f64>,
         radius: CornerRadius,
         xray_pos: XrayPos,
+        above: Option<(f64, CornerRadius)>,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
         let should_block_out = ctx.target.should_block_out(self.rules.block_out_from);
-        background_effect::render_for_tile(
+        background_effect::render_for_tile_above(
             ctx,
             None,
             geometry,
@@ -763,6 +765,8 @@ impl LayoutElement for Mapped {
             self.rules.background_effect,
             should_block_out,
             xray_pos,
+            None,
+            above,
             push,
         );
     }
@@ -943,6 +947,14 @@ impl LayoutElement for Mapped {
             }),
             _ => false,
         }
+    }
+
+    fn title(&self) -> Option<String> {
+        with_toplevel_role(self.toplevel(), |role| role.title.clone())
+    }
+
+    fn is_floating(&self) -> bool {
+        self.is_floating
     }
 
     fn output_enter(&self, output: &Output) {

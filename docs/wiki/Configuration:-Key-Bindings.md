@@ -81,6 +81,15 @@ binds {
 
 This is mostly useful for the scroll bindings.
 
+
+<sup>Tuned build</sup> `unbind` as the action removes an earlier binding of the key (from an included file) and binds nothing, so the key goes to the focused window:
+
+```kdl
+binds {
+    Mod+T { unbind; }
+}
+```
+
 ### Scroll Bindings
 
 You can bind mouse wheel scroll ticks using the following syntax.

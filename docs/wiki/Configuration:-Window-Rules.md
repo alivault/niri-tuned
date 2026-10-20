@@ -95,6 +95,11 @@ window-rule {
         // urgent-gradient from="#800" to="#a33" angle=45
     }
 
+    titlebar {
+        off
+        // Any option of the layout's titlebar.
+    }
+
     geometry-corner-radius 12
     clip-to-geometry true
     tiled-state true
@@ -125,6 +130,13 @@ window-rule {
     max-height 300
 }
 ```
+
+### Named rules
+
+<sup>Tuned build</sup> A rule can have a name: `window-rule "calculator" { ... }`.
+A later rule with the same name, in the same file or one included after it, changes that rule where it stands: it is placed right after it, applies to the same windows unless it has a `match` or `exclude` of its own, and only the properties it sets change.
+`off` inside a named rule switches every earlier rule of that name off.
+See [Include](./Configuration:-Include.md#multipart-sections) for an example.
 
 ### Window Matching
 
@@ -811,6 +823,23 @@ window-rule {
 
     tab-indicator {
         inactive-color "darkred"
+    }
+}
+```
+
+#### `titlebar`
+
+<sup>niri-tuned</sup>
+
+Override the [`titlebar` options in the layout section](./Configuration:-Layout.md#titlebar) for these windows: turn the title bar `off` (or `on`), or change its height, font or colours.
+
+```kdl
+// No title bar on terminals.
+window-rule {
+    match app-id="^foot$"
+
+    titlebar {
+        off
     }
 }
 ```

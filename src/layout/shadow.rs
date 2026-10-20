@@ -48,16 +48,17 @@ impl Shadow {
         // * We do not divide anything, only add, subtract and multiply by integers.
         // * At rendering time, tile positions are rounded to physical pixels.
 
-        let width = self.config.softness;
+        // Tuned: an inactive window's shadow may have its own size and place.
+        let (softness, spread, offset) = self.config.geometry(is_active);
+
+        let width = softness;
         // Like in CSS box-shadow.
         let sigma = width / 2.;
         // Adjust width to draw all necessary pixels.
         let width = ceil(sigma * 3.);
 
-        let offset = self.config.offset;
         let offset = Point::from((ceil(offset.x.0), ceil(offset.y.0)));
 
-        let spread = self.config.spread;
         let spread = ceil(spread.abs()).copysign(spread);
         let offset = offset - Point::from((spread, spread));
 
@@ -76,10 +77,8 @@ impl Shadow {
         let color = if is_active {
             self.config.color
         } else {
-            // Default to slightly more transparent.
-            self.config
-                .inactive_color
-                .unwrap_or(self.config.color * 0.75)
+            // Unset: the active window's, like the other inactive-* settings.
+            self.config.inactive_color.unwrap_or(self.config.color)
         };
 
         let shader_geo = Rectangle::new(Point::from((-width, -width)), shader_size);

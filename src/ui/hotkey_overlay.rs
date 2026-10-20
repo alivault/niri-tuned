@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn test_format_bind() {
         // Not bound.
-        assert_snapshot!(check("", Action::Screenshot(true, None)), @" (not bound) : Take a Screenshot");
+        assert_snapshot!(check("", Action::Screenshot(None, None)), @" (not bound) : Take a Screenshot");
 
         // Bound with a default title.
         assert_snapshot!(
@@ -635,7 +635,7 @@ mod tests {
                 r#"binds {
                     Mod+P { screenshot; }
                 }"#,
-                Action::Screenshot(true, None),
+                Action::Screenshot(None, None),
             ),
             @" Super + P : Take a Screenshot"
         );
@@ -646,7 +646,7 @@ mod tests {
                 r#"binds {
                     Mod+P hotkey-overlay-title="Hello" { screenshot; }
                 }"#,
-                Action::Screenshot(true, None),
+                Action::Screenshot(None, None),
             ),
             @" Super + P : Hello"
         );
@@ -658,7 +658,7 @@ mod tests {
                     Mod+P { screenshot; }
                     Print { screenshot; }
                 }"#,
-                Action::Screenshot(true, None),
+                Action::Screenshot(None, None),
             ),
             @" Super + P : Take a Screenshot"
         );
@@ -670,7 +670,7 @@ mod tests {
                     Mod+P { screenshot; }
                     Print hotkey-overlay-title="My Cool Bind" { screenshot; }
                 }"#,
-                Action::Screenshot(true, None),
+                Action::Screenshot(None, None),
             ),
             @" PrtSc : My Cool Bind"
         );
@@ -682,7 +682,7 @@ mod tests {
                     Mod+P hotkey-overlay-title="First" { screenshot; }
                     Print hotkey-overlay-title="My Cool Bind" { screenshot; }
                 }"#,
-                Action::Screenshot(true, None),
+                Action::Screenshot(None, None),
             ),
             @" Super + P : First"
         );
@@ -694,7 +694,7 @@ mod tests {
                     Mod+P { screenshot; }
                     Print hotkey-overlay-title=null { screenshot; }
                 }"#,
-                Action::Screenshot(true, None),
+                Action::Screenshot(None, None),
             ),
             @"None"
         );
@@ -706,7 +706,7 @@ mod tests {
                     Mod+P hotkey-overlay-title="Hello" { screenshot; }
                     Print hotkey-overlay-title=null { screenshot; }
                 }"#,
-                Action::Screenshot(true, None),
+                Action::Screenshot(None, None),
             ),
             @" Super + P : Hello"
         );

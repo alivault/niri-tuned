@@ -17,6 +17,7 @@ use super::workspace::{
     compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
     WorkspaceRenderElement,
 };
+use super::workspace_highlight::WorkspaceHighlights;
 use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
 use crate::animation::{Animation, Clock};
 use crate::input::swipe_tracker::SwipeTracker;
@@ -76,10 +77,14 @@ pub struct Monitor<W: LayoutElement> {
     insert_hint_element: InsertHintElement,
     /// Location to render the insert hint element.
     insert_hint_render_loc: Option<InsertHintRenderLoc>,
+    /// Each workspace's highlight in the overview.
+    workspace_highlights: WorkspaceHighlights,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    /// Pinch multiplier on the overview zoom, synchronized from the layout.
+    overview_zoom_scale: f64,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -187,6 +192,7 @@ niri_render_elements! {
     MonitorInnerRenderElement<R> => {
         Workspace = CropRenderElement<WorkspaceRenderElement<R>>,
         InsertHint = CropRenderElement<InsertHintRenderElement>,
+        // Also the workspaces' highlights (the same focus ring elements).
         UncroppedInsertHint = InsertHintRenderElement,
         Shadow = ShadowRenderElement,
         SolidColor = SolidColorRenderElement,
@@ -339,8 +345,10 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint: None,
             insert_hint_element: InsertHintElement::new(options.layout.insert_hint),
             insert_hint_render_loc: None,
+            workspace_highlights: WorkspaceHighlights::default(),
             overview_open: false,
             overview_progress: None,
+            overview_zoom_scale: 1.,
             workspace_switch: None,
             clock,
             base_options,
@@ -369,6 +377,17 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn active_workspace_idx(&self) -> usize {
         self.active_workspace_idx
+    }
+
+    /// Where the view is headed: the workspace (fractional during a switch gesture) and the
+    /// active workspace's scrolling view position (following a view gesture). Animations
+    /// towards an unchanged target don't change it.
+    pub fn view_target(&self) -> (f64, f64) {
+        let ws = match &self.workspace_switch {
+            Some(WorkspaceSwitch::Gesture(_)) => self.workspace_render_idx(),
+            _ => self.active_workspace_idx as f64,
+        };
+        (ws, self.active_workspace_ref().target_view_pos())
     }
 
     pub fn active_workspace_ref(&self) -> &Workspace<W> {
@@ -424,6 +443,34 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn add_workspace_top(&mut self) {
         self.add_workspace_at(0);
+    }
+
+    /// Before moving a window (or its whole column) up off the first workspace, adds an empty
+    /// workspace above it to receive it. Returns false when there is nowhere to move: there is
+    /// nothing to move, the first workspace is already the kept empty one, or moving would only
+    /// trade an unnamed workspace for a new one holding the same windows.
+    fn add_workspace_above_first_for_move(&mut self, whole_column: bool) -> bool {
+        if self.active_workspace_idx != 0 || self.options.layout.empty_workspace_above_first {
+            return false;
+        }
+
+        let ws = &self.workspaces[0];
+        let moving = if whole_column && !ws.floating_is_active() {
+            match ws.active_column_window_count() {
+                Some(count) => count,
+                None => return false,
+            }
+        } else if ws.active_window().is_some() {
+            1
+        } else {
+            return false;
+        };
+        if ws.name().is_none() && ws.windows().count() <= moving {
+            return false;
+        }
+
+        self.add_workspace_top();
+        true
     }
 
     pub fn add_workspace_bottom(&mut self) {
@@ -783,6 +830,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn move_to_workspace_up(&mut self, focus: bool) {
+        self.add_workspace_above_first_for_move(false);
         let source_workspace_idx = self.active_workspace_idx;
 
         let new_idx = source_workspace_idx.saturating_sub(1);
@@ -908,6 +956,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn move_column_to_workspace_up(&mut self, activate: bool) {
+        self.add_workspace_above_first_for_move(true);
         let source_workspace_idx = self.active_workspace_idx;
 
         let new_idx = source_workspace_idx.saturating_sub(1);
@@ -1104,6 +1153,27 @@ impl<W: LayoutElement> Monitor<W> {
             }
         }
 
+        let progress = self.overview_progress_clamped();
+        let geos: Vec<_> = if progress.is_some() {
+            // Drawn while it or its border may be on the output.
+            let mut output_geo = Rectangle::from_size(self.view_size);
+            output_geo.loc -= Point::from((64., 64.));
+            output_geo.size += Size::from((128., 128.));
+            self.workspaces_render_geo()
+                .take(self.workspaces.len())
+                .map(|geo| geo.intersection(output_geo).map(|_| geo))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.workspace_highlights.update_render_elements(
+            &self.options.overview.workspace_highlight,
+            geos.into_iter(),
+            self.active_workspace_idx,
+            self.scale.fractional_scale(),
+            progress,
+        );
+
         self.insert_hint_render_loc = None;
         if let Some(hint) = &self.insert_hint {
             match hint.workspace {
@@ -1227,6 +1297,7 @@ impl<W: LayoutElement> Monitor<W> {
         }
 
         self.insert_hint_element.update_shaders();
+        self.workspace_highlights.update_shaders();
     }
 
     pub fn update_output_size(&mut self) {
@@ -1370,14 +1441,27 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspace_size(zoom) + Size::from((0., gap))
     }
 
-    pub fn overview_zoom(&self) -> f64 {
-        let progress = self.overview_progress.as_ref().map(|p| p.value());
-        compute_overview_zoom(&self.options, progress)
+    /// The overview's progress, 0 closed to 1 open, following its animations and the touchpad
+    /// gesture; `None` while it is closed.
+    pub fn overview_progress_clamped(&self) -> Option<f64> {
+        self.overview_progress
+            .as_ref()
+            .map(|p| p.clamped_value().clamp(0., 1.))
     }
 
-    pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
+    pub fn overview_zoom(&self) -> f64 {
+        let progress = self.overview_progress.as_ref().map(|p| p.value());
+        compute_overview_zoom(&self.options, progress, self.overview_zoom_scale)
+    }
+
+    pub(super) fn set_overview_progress(
+        &mut self,
+        progress: Option<&super::OverviewProgress>,
+        zoom_scale: f64,
+    ) {
         let prev_render_idx = self.workspace_render_idx();
         self.overview_progress = progress.map(OverviewProgress::from);
+        self.overview_zoom_scale = zoom_scale;
         let new_render_idx = self.workspace_render_idx();
 
         // If the view jumped (can happen when going from corrected to uncorrected render_idx, for
@@ -1394,6 +1478,11 @@ impl<W: LayoutElement> Monitor<W> {
     #[cfg(test)]
     pub(super) fn overview_progress_value(&self) -> Option<f64> {
         self.overview_progress.as_ref().map(|p| p.value())
+    }
+
+    /// Whether a workspace switch (gesture or animation) is in progress.
+    pub fn is_workspace_switch_ongoing(&self) -> bool {
+        self.workspace_switch.is_some()
     }
 
     pub fn workspace_render_idx(&self) -> f64 {
@@ -1451,7 +1540,8 @@ impl<W: LayoutElement> Monitor<W> {
                 // - first_y = to * from_height - switch_anim.value() * from_height - to * current_height
                 // - first_y = -switch_anim.value() * from_height + to * (from_height - current_height)
                 let from = progress_anim.from();
-                let from_zoom = compute_overview_zoom(&self.options, Some(from));
+                let from_zoom =
+                    compute_overview_zoom(&self.options, Some(from), self.overview_zoom_scale);
                 let from_ws_height_with_gap = self.workspace_size_with_gap(from_zoom).h;
 
                 let zoom = self.overview_zoom();
@@ -1584,6 +1674,18 @@ impl<W: LayoutElement> Monitor<W> {
         ws.resize_edges_under(pos_within_output - geo.loc)
     }
 
+    pub fn edge_resize_under(
+        &self,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, ResizeEdge)> {
+        if self.overview_progress.is_some() {
+            return None;
+        }
+
+        let (ws, geo) = self.workspace_under(pos_within_output)?;
+        ws.edge_resize_under(pos_within_output - geo.loc)
+    }
+
     pub(super) fn insert_position(
         &self,
         pos_within_output: Point<f64, Logical>,
@@ -1690,7 +1792,14 @@ impl<W: LayoutElement> Monitor<W> {
         // rendering for maximized GTK windows.
         //
         // FIXME: use proper bounds after fixing the Crop element.
-        let crop_bounds = if self.workspace_switch.is_some() || self.overview_progress.is_some() {
+        //
+        // Transparent workspaces (the wallpaper in the backdrop behind them) have no edge to
+        // overflow: nothing is cropped, so window shadows stay whole in the overview and
+        // during a switch.
+        let crop_bounds = if crops_vertically(
+            self.workspace_switch.is_some() || self.overview_progress.is_some(),
+            self.options.layout.background_color.a,
+        ) {
             Rectangle::new(
                 Point::from((-i32::MAX / 2, 0)),
                 Size::from((i32::MAX, height)),
@@ -1777,6 +1886,31 @@ impl<W: LayoutElement> Monitor<W> {
                 push(elem);
             });
         }
+    }
+
+    /// The workspaces' highlights (the overview only): drawn at the workspaces' zoomed size, so
+    /// not rescaled.
+    pub fn render_workspace_highlights<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        push: &mut dyn FnMut(MonitorRenderElement<R>),
+    ) {
+        if self.overview_progress.is_none() {
+            return;
+        }
+
+        let scale = self.scale.fractional_scale();
+        self.workspace_highlights
+            .render(renderer, &mut |loc, elem| {
+                let elem = MonitorInnerRenderElement::UncroppedInsertHint(elem);
+                let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), 1.);
+                let elem = RelocateRenderElement::from_element(
+                    elem,
+                    loc.to_physical_precise_round(scale),
+                    Relocate::Relative,
+                );
+                push(elem);
+            });
     }
 
     pub fn workspace_switch_gesture_begin(&mut self, is_touchpad: bool) {
@@ -2162,5 +2296,26 @@ impl<W: LayoutElement> Monitor<W> {
             assert_abs_diff_eq!(pos.x, rounded_pos.x, epsilon = 1e-5);
             assert_abs_diff_eq!(pos.y, rounded_pos.y, epsilon = 1e-5);
         }
+    }
+}
+
+/// Whether workspaces are cropped to their height: only while they move past each other (a
+/// switch or the overview), and only when they have a background to overflow. Transparent
+/// workspaces show the backdrop through them, so a shadow past the edge is drawn whole.
+fn crops_vertically(workspaces_moving: bool, background_alpha: f32) -> bool {
+    workspaces_moving && background_alpha > 0.
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::crops_vertically;
+
+    #[test]
+    fn transparent_workspaces_are_never_cropped() {
+        assert!(crops_vertically(true, 1.));
+        assert!(crops_vertically(true, 0.5));
+        assert!(!crops_vertically(true, 0.));
+        assert!(!crops_vertically(false, 1.));
+        assert!(!crops_vertically(false, 0.));
     }
 }

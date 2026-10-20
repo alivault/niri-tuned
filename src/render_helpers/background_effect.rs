@@ -6,6 +6,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
 
+use crate::animation::{Animation, Clock};
 use crate::handlers::background_effect::get_cached_blur_region;
 use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
@@ -28,6 +29,104 @@ pub struct BackgroundEffect {
     corner_radius: CornerRadius,
     blur_config: niri_config::Blur,
     options: Options,
+    /// Fade of a surface-requested blur region; see [`RegionFade`].
+    region_fade: RegionFade,
+}
+
+/// A surface's blur region as non-overlapping surface-local rects.
+type BlurRects = Arc<Vec<Rectangle<i32, Logical>>>;
+
+/// How a surface's own blur region (ext-background-effect) fades in and out.
+///
+/// The protocol has no alpha, so a client fading its surface cannot fade the blur behind it.
+/// With a fade configured, the effect instead fades in when the surface first requests a
+/// region and fades out when it drops it, drawing the last region until the fade-out ends.
+/// Changes between two non-empty regions (moving, resizing, swapping) apply at once.
+#[derive(Debug, Default)]
+struct RegionFade {
+    /// Whether the surface requested a non-empty region as of the last update.
+    requested: bool,
+    /// Last non-empty region, drawn while fading out.
+    held: Option<BlurRects>,
+    /// Ongoing fade, from 0 (no effect) to 1 (full effect) or back.
+    anim: Option<Animation>,
+}
+
+/// Clock and animation for fading surface-requested blur regions.
+#[derive(Debug, Clone)]
+pub struct BlurFade {
+    pub clock: Clock,
+    pub config: niri_config::Animation,
+}
+
+impl RegionFade {
+    /// Tracks `region` and returns the region to draw and its alpha.
+    fn update(
+        &mut self,
+        region: Option<BlurRects>,
+        fade: Option<&BlurFade>,
+    ) -> (Option<BlurRects>, f32) {
+        let requested = region.as_ref().is_some_and(|r| !r.is_empty());
+
+        let Some(fade) = fade else {
+            *self = Self {
+                requested,
+                ..Self::default()
+            };
+            return (region, 1.);
+        };
+
+        if requested != self.requested {
+            let current = match &self.anim {
+                Some(anim) => anim.clamped_value(),
+                None if self.requested => 1.,
+                None => 0.,
+            };
+            let target = if requested { 1. } else { 0. };
+            self.anim = Some(Animation::new(
+                fade.clock.clone(),
+                current,
+                target,
+                0.,
+                fade.config,
+            ));
+            self.requested = requested;
+        }
+
+        if requested {
+            self.held = region.clone();
+        }
+
+        let alpha = self
+            .anim
+            .as_ref()
+            .map_or(1., |anim| anim.clamped_value().clamp(0., 1.)) as f32;
+
+        if self
+            .anim
+            .as_ref()
+            .is_some_and(|anim| anim.is_clamped_done())
+        {
+            self.anim = None;
+            if !requested {
+                self.held = None;
+            }
+        }
+
+        if requested {
+            (region, alpha)
+        } else if let Some(held) = &self.held {
+            (Some(held.clone()), alpha)
+        } else {
+            (region, 1.)
+        }
+    }
+
+    /// Whether a fade is running or about to start on the next render.
+    fn is_ongoing(&self, region: Option<&BlurRects>) -> bool {
+        let requested = region.is_some_and(|r| !r.is_empty());
+        self.anim.is_some() || requested != self.requested
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -89,6 +188,7 @@ impl BackgroundEffect {
             corner_radius: CornerRadius::default(),
             blur_config: niri_config::Blur::default(),
             options: Options::default(),
+            region_fade: RegionFade::default(),
         }
     }
 
@@ -154,9 +254,10 @@ impl BackgroundEffect {
         ns: Option<usize>,
         mut params: RenderParams,
         xray_pos: XrayPos,
+        alpha: f32,
         push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
-        if !self.is_visible() {
+        if !self.is_visible() || alpha <= 0. {
             return;
         }
 
@@ -193,13 +294,14 @@ impl BackgroundEffect {
                 blur,
                 noise,
                 saturation,
-                &mut |elem| push(elem.into()),
+                &mut |elem| push(elem.with_alpha(alpha).into()),
             );
         } else {
             // Render non-xray effect.
             let elem = self
                 .nonxray
-                .render(ns, params, blur_options, noise, saturation);
+                .render(ns, params, blur_options, noise, saturation)
+                .with_alpha(alpha);
             push(elem.into());
         }
     }
@@ -210,7 +312,7 @@ fn render_params_for_tile(
     scale: f64,
     clip_to_geometry: bool,
     block_out: bool,
-    blur_region: Option<Arc<Vec<Rectangle<i32, Logical>>>>,
+    blur_region: Option<BlurRects>,
     surface_geo: Rectangle<f64, Logical>,
     surface_anim_scale: Scale<f64>,
 ) -> Option<RenderParams> {
@@ -278,8 +380,25 @@ pub fn damage_surface(states: &SurfaceData) {
     }
 }
 
+/// Whether the surface's blur region is fading, or will start fading on the next render.
+pub fn is_fade_ongoing(surface: &WlSurface) -> bool {
+    with_states(surface, |states| {
+        let Some(effect) = states.data_map.get::<SurfaceBackgroundEffect>() else {
+            return false;
+        };
+        let region = get_cached_blur_region(states);
+        effect
+            .0
+            .lock()
+            .unwrap()
+            .region_fade
+            .is_ongoing(region.as_ref())
+    })
+}
+
 // Silence, Clippy
 // A Smithay user is talking
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_for_tile(
     ctx: RenderCtx<GlesRenderer>,
@@ -295,6 +414,49 @@ pub fn render_for_tile(
     effect: niri_config::BackgroundEffect,
     should_block_out: bool,
     xray_pos: XrayPos,
+    fade: Option<&BlurFade>,
+    push: &mut dyn FnMut(BackgroundEffectElement),
+) {
+    render_for_tile_above(
+        ctx,
+        ns,
+        geometry,
+        scale,
+        clip_to_geometry,
+        surface,
+        surface_off,
+        surface_anim_scale,
+        blur_config,
+        radius,
+        effect,
+        should_block_out,
+        xray_pos,
+        fade,
+        None,
+        push,
+    );
+}
+
+/// [`render_for_tile`], with the effect reaching `above` (height, corner radius of the whole)
+/// over the window when the effect is the window rule's rather than the surface's own region:
+/// behind the title bar niri draws there.
+#[allow(clippy::too_many_arguments)]
+pub fn render_for_tile_above(
+    ctx: RenderCtx<GlesRenderer>,
+    ns: Option<usize>,
+    geometry: Rectangle<f64, Logical>,
+    scale: f64,
+    clip_to_geometry: bool,
+    surface: &WlSurface,
+    surface_off: Point<f64, Logical>,
+    surface_anim_scale: Scale<f64>,
+    blur_config: niri_config::Blur,
+    radius: CornerRadius,
+    effect: niri_config::BackgroundEffect,
+    should_block_out: bool,
+    mut xray_pos: XrayPos,
+    fade: Option<&BlurFade>,
+    above: Option<(f64, CornerRadius)>,
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
     with_states(surface, |states| {
@@ -302,7 +464,21 @@ pub fn render_for_tile(
         let mut background_effect = background_effect.0.lock().unwrap();
 
         let blur_region = get_cached_blur_region(states);
+        let (blur_region, alpha) = background_effect.region_fade.update(blur_region, fade);
         let has_blur_region = blur_region.as_ref().is_some_and(|r| !r.is_empty());
+
+        // A surface's own region stays its own; the rule's effect covers the title bar too.
+        let above = above.filter(|_| blur_region.is_none());
+        let (geometry, radius) = match above {
+            Some((height, radius)) => {
+                let mut geometry = geometry;
+                geometry.loc.y -= height;
+                geometry.size.h += height;
+                xray_pos = xray_pos.offset(Point::from((0., -height)));
+                (geometry, radius)
+            }
+            None => (geometry, radius),
+        };
 
         background_effect.update_config(blur_config);
         background_effect.update_render_elements(radius, effect, has_blur_region);
@@ -327,6 +503,142 @@ pub fn render_for_tile(
         };
 
         let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
-        background_effect.render(ctx, ns, params, xray_pos, push);
+        background_effect.render(ctx, ns, params, xray_pos, alpha, push);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn region() -> Option<Arc<Vec<Rectangle<i32, Logical>>>> {
+        Some(Arc::new(vec![Rectangle::new(
+            (10, 10).into(),
+            (100, 50).into(),
+        )]))
+    }
+
+    fn fade(clock: &Clock) -> BlurFade {
+        BlurFade {
+            clock: clock.clone(),
+            config: niri_config::animations::BlurFadeAnim::default().0,
+        }
+    }
+
+    fn at(clock: &mut Clock, ms: u64) {
+        clock.set_unadjusted(Duration::from_millis(ms));
+    }
+
+    #[test]
+    fn fades_in_when_region_appears() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let fade = fade(&clock);
+        let mut state = RegionFade::default();
+
+        let (drawn, alpha) = state.update(region(), Some(&fade));
+        assert_eq!(drawn, region());
+        assert_eq!(alpha, 0.);
+        assert!(state.is_ongoing(region().as_ref()));
+
+        at(&mut clock, 70);
+        let (_, alpha) = state.update(region(), Some(&fade));
+        assert!(alpha > 0. && alpha < 1., "{alpha}");
+
+        at(&mut clock, 140);
+        let (_, alpha) = state.update(region(), Some(&fade));
+        assert_eq!(alpha, 1.);
+        assert!(!state.is_ongoing(region().as_ref()));
+    }
+
+    #[test]
+    fn keeps_last_region_while_fading_out() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let fade = fade(&clock);
+        let mut state = RegionFade::default();
+        state.update(region(), Some(&fade));
+        at(&mut clock, 200);
+        state.update(region(), Some(&fade));
+
+        // The client drops its region: pending until the next render.
+        assert!(state.is_ongoing(None));
+
+        let (drawn, alpha) = state.update(None, Some(&fade));
+        assert_eq!(drawn, region());
+        assert_eq!(alpha, 1.);
+
+        at(&mut clock, 270);
+        let (drawn, alpha) = state.update(None, Some(&fade));
+        assert_eq!(drawn, region());
+        assert!(alpha > 0. && alpha < 1., "{alpha}");
+
+        // Fade finished: nothing held any more.
+        at(&mut clock, 340);
+        let (drawn, alpha) = state.update(None, Some(&fade));
+        assert_eq!(drawn, None);
+        assert_eq!(alpha, 1.);
+        assert!(!state.is_ongoing(None));
+    }
+
+    #[test]
+    fn empty_region_counts_as_dropped() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let fade = fade(&clock);
+        let mut state = RegionFade::default();
+        state.update(region(), Some(&fade));
+        at(&mut clock, 200);
+        state.update(region(), Some(&fade));
+
+        let empty = Some(Arc::new(Vec::new()));
+        let (drawn, _) = state.update(empty, Some(&fade));
+        assert_eq!(drawn, region());
+    }
+
+    #[test]
+    fn reversing_mid_fade_starts_from_current_alpha() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let fade = fade(&clock);
+        let mut state = RegionFade::default();
+        state.update(region(), Some(&fade));
+        at(&mut clock, 50);
+        let (_, alpha_in) = state.update(region(), Some(&fade));
+
+        let (_, alpha_out) = state.update(None, Some(&fade));
+        assert!(
+            (alpha_out - alpha_in).abs() < 1e-6,
+            "{alpha_in} -> {alpha_out}"
+        );
+    }
+
+    #[test]
+    fn region_changes_apply_at_once() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let fade = fade(&clock);
+        let mut state = RegionFade::default();
+        state.update(region(), Some(&fade));
+        at(&mut clock, 200);
+        state.update(region(), Some(&fade));
+
+        let moved = Some(Arc::new(vec![Rectangle::new(
+            (50, 10).into(),
+            (80, 40).into(),
+        )]));
+        let (drawn, alpha) = state.update(moved.clone(), Some(&fade));
+        assert_eq!(drawn, moved);
+        assert_eq!(alpha, 1.);
+        assert!(!state.is_ongoing(moved.as_ref()));
+    }
+
+    #[test]
+    fn without_fade_nothing_is_held() {
+        let clock = Clock::with_time(Duration::ZERO);
+        let fade = fade(&clock);
+        let mut state = RegionFade::default();
+        state.update(region(), Some(&fade));
+
+        assert_eq!(state.update(region(), None), (region(), 1.));
+        assert_eq!(state.update(None, None), (None, 1.));
+        assert!(!state.is_ongoing(None));
+    }
 }

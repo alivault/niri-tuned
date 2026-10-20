@@ -41,6 +41,7 @@ struct TestWindowInner {
     animate_next_configure: Cell<bool>,
     animation_snapshot: RefCell<Option<LayoutElementRenderSnapshot>>,
     rules: ResolvedWindowRules,
+    has_ssd: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +60,7 @@ struct TestWindowParams {
     min_max_size: (Size<i32, Logical>, Size<i32, Logical>),
     #[proptest(strategy = "prop::option::of(arbitrary_rules())")]
     rules: Option<ResolvedWindowRules>,
+    has_ssd: bool,
 }
 
 impl TestWindowParams {
@@ -70,6 +72,7 @@ impl TestWindowParams {
             bbox: Rectangle::from_size(Size::from((100, 200))),
             min_max_size: Default::default(),
             rules: None,
+            has_ssd: false,
         }
     }
 }
@@ -93,6 +96,7 @@ impl TestWindow {
             animate_next_configure: Cell::new(false),
             animation_snapshot: RefCell::new(None),
             rules: params.rules.unwrap_or_default(),
+            has_ssd: params.has_ssd,
         }))
     }
 
@@ -202,7 +206,7 @@ impl LayoutElement for TestWindow {
     fn set_preferred_scale_transform(&self, _scale: output::Scale, _transform: Transform) {}
 
     fn has_ssd(&self) -> bool {
-        false
+        self.0.has_ssd
     }
 
     fn output_enter(&self, _output: &Output) {}
@@ -2785,6 +2789,106 @@ fn move_window_to_empty_workspace_above_first() {
     check_ops_with_options(options, ops);
 }
 
+fn first_monitor(layout: Layout<TestWindow>) -> Monitor<TestWindow> {
+    let MonitorSet::Normal { mut monitors, .. } = layout.monitor_set else {
+        unreachable!()
+    };
+    monitors.remove(0)
+}
+
+#[test]
+fn move_column_up_off_first_workspace_adds_workspace() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: None },
+        Op::MoveColumnToWorkspaceUp(true),
+    ];
+    let mon = first_monitor(check_ops(ops));
+    assert_eq!(mon.workspaces.len(), 3);
+    assert_eq!(mon.active_workspace_idx, 0);
+    assert_eq!(mon.workspaces[0].windows().count(), 2);
+    assert_eq!(mon.workspaces[1].windows().count(), 1);
+}
+
+#[test]
+fn move_window_up_off_first_workspace_adds_workspace() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: None },
+        Op::MoveWindowToWorkspaceUp(false),
+    ];
+    let mon = first_monitor(check_ops(ops));
+    assert_eq!(mon.workspaces.len(), 3);
+    assert_eq!(mon.active_workspace_idx, 1);
+    assert_eq!(mon.workspaces[0].windows().count(), 1);
+    assert_eq!(mon.workspaces[1].windows().count(), 1);
+}
+
+#[test]
+fn move_lone_window_up_off_unnamed_first_workspace_does_nothing() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::MoveWindowToWorkspaceUp(true),
+    ];
+    let mon = first_monitor(check_ops(ops));
+    assert_eq!(mon.workspaces.len(), 2);
+    assert_eq!(mon.active_workspace_idx, 0);
+    assert_eq!(mon.workspaces[0].windows().count(), 1);
+}
+
+#[test]
+fn move_lone_column_up_off_unnamed_first_workspace_does_nothing() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::MoveColumnToWorkspaceUp(true),
+    ];
+    let mon = first_monitor(check_ops(ops));
+    assert_eq!(mon.workspaces.len(), 2);
+    assert_eq!(mon.active_workspace_idx, 0);
+    assert_eq!(mon.workspaces[0].windows().count(), 1);
+}
+
+#[test]
+fn move_lone_column_up_off_named_first_workspace_adds_workspace() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::SetWorkspaceName {
+            new_ws_name: 1,
+            ws_name: None,
+        },
+        Op::MoveColumnToWorkspaceUp(true),
+    ];
+    let mon = first_monitor(check_ops(ops));
+    assert_eq!(mon.workspaces.len(), 3);
+    assert_eq!(mon.active_workspace_idx, 0);
+    assert_eq!(mon.workspaces[0].windows().count(), 1);
+    assert!(mon.workspaces[1].name().is_some());
+}
+
 #[test]
 fn move_window_to_different_output() {
     let ops = [
@@ -3631,6 +3735,229 @@ fn move_window_to_workspace_maximize_and_fullscreen() {
 }
 
 #[test]
+fn titlebar_takes_tile_height() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                has_ssd: true,
+                ..TestWindowParams::new(0)
+            },
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: None },
+        Op::Communicate(0),
+        Op::Communicate(1),
+    ];
+
+    let options = Options {
+        layout: niri_config::Layout {
+            border: niri_config::Border {
+                off: false,
+                width: 2.,
+                ..Default::default()
+            },
+            titlebar: niri_config::Titlebar {
+                off: false,
+                height: 30.,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let layout = check_ops_with_options(options, ops);
+
+    let ws = layout.active_workspace().unwrap();
+    let mut tiles = ws.tiles();
+    let ssd = tiles.next().unwrap();
+    let csd = tiles.next().unwrap();
+    let (ssd, csd) = if ssd.window().has_ssd() {
+        (ssd, csd)
+    } else {
+        (csd, ssd)
+    };
+
+    // Only the window with server-side decorations gets a title bar, between border and window.
+    assert_eq!(ssd.titlebar_height(), 30.);
+    assert_eq!(csd.titlebar_height(), 0.);
+    assert_eq!(ssd.window_loc(), Point::from((2., 32.)));
+    assert_eq!(csd.window_loc(), Point::from((2., 2.)));
+    assert_eq!(ssd.tile_size().h, ssd.window_size().h + 34.);
+    assert_eq!(csd.tile_size().h, csd.window_size().h + 4.);
+    assert_eq!(ssd.tile_height_for_window_height(100.), 134.);
+    assert_eq!(ssd.window_height_for_tile_height(134.), 100.);
+
+    // The bar is hit as a title bar; the window below it as the window.
+    assert!(matches!(
+        ssd.hit(Point::from((90., 15.))),
+        Some(HitType::Activate {
+            titlebar: Some(super::titlebar::TitlebarPart::Bar),
+            ..
+        })
+    ));
+    // The buttons are on the left by default, close outermost.
+    assert!(matches!(
+        ssd.hit(Point::from((2. + 4. + 15., 17.))),
+        Some(HitType::Activate {
+            titlebar: Some(super::titlebar::TitlebarPart::Button(
+                niri_config::TitlebarButton::Close
+            )),
+            ..
+        })
+    ));
+    assert!(matches!(
+        ssd.hit(Point::from((2. + 4. + 45., 17.))),
+        Some(HitType::Activate {
+            titlebar: Some(super::titlebar::TitlebarPart::Button(
+                niri_config::TitlebarButton::MaximizeColumn
+            )),
+            ..
+        })
+    ));
+    // Two buttons by default: the bar starts after them.
+    assert!(matches!(
+        ssd.hit(Point::from((2. + 4. + 75., 17.))),
+        Some(HitType::Activate {
+            titlebar: Some(super::titlebar::TitlebarPart::Bar),
+            ..
+        })
+    ));
+    assert!(matches!(
+        ssd.hit(Point::from((10., 40.))),
+        Some(HitType::Activate { titlebar: None, .. })
+    ));
+}
+
+#[test]
+fn transparent_titlebar_runs_the_window_under_it() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams {
+                has_ssd: true,
+                rules: Some(ResolvedWindowRules {
+                    titlebar: niri_config::TitlebarRule {
+                        unified: Some(Flag(true)),
+                        height: Some(FloatOrInt(52.)),
+                        ..Default::default()
+                    },
+                    ..ResolvedWindowRules::default()
+                }),
+                ..TestWindowParams::new(0)
+            },
+        },
+        Op::Communicate(0),
+    ];
+
+    let options = Options {
+        layout: niri_config::Layout {
+            border: niri_config::Border {
+                off: false,
+                width: 2.,
+                ..Default::default()
+            },
+            titlebar: niri_config::Titlebar {
+                off: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let layout = check_ops_with_options(options, ops);
+    let tile = layout.active_workspace().unwrap().tiles().next().unwrap();
+
+    // Nothing is reserved: the window starts right inside the border.
+    assert_eq!(tile.titlebar_height(), 0.);
+    assert_eq!(tile.window_loc(), Point::from((2., 2.)));
+    assert_eq!(tile.tile_size().h, tile.window_size().h + 4.);
+
+    // The buttons, centred on the 52 px bar, are still niri's.
+    assert!(matches!(
+        tile.hit(Point::from((2. + 4. + 15., 2. + 26.))),
+        Some(HitType::Activate {
+            titlebar: Some(super::titlebar::TitlebarPart::Button(
+                niri_config::TitlebarButton::Close
+            )),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn edge_resize_bands() {
+    use super::tile::edge_resize_edges;
+    use crate::utils::ResizeEdge;
+
+    let size = Size::from((400., 300.));
+    let at = |x: f64, y: f64| edge_resize_edges(size, 2., 6., 16., Point::from((x, y)));
+
+    // In the gap outside each side, and on the border inside.
+    assert_eq!(at(-3., 150.), Some(ResizeEdge::LEFT));
+    assert_eq!(at(1., 150.), Some(ResizeEdge::LEFT));
+    assert_eq!(at(405., 150.), Some(ResizeEdge::RIGHT));
+    assert_eq!(at(200., -6.), Some(ResizeEdge::TOP));
+    assert_eq!(at(200., 299.), Some(ResizeEdge::BOTTOM));
+    // Past the margin, or inside the border: not an edge.
+    assert_eq!(at(-7., 150.), None);
+    assert_eq!(at(200., 150.), None);
+    assert_eq!(at(3., 150.), None);
+    // Near a corner along either edge: the corner.
+    assert_eq!(at(-2., 10.), Some(ResizeEdge::TOP_LEFT));
+    assert_eq!(at(10., -2.), Some(ResizeEdge::TOP_LEFT));
+    assert_eq!(at(395., 304.), Some(ResizeEdge::BOTTOM_RIGHT));
+    assert_eq!(at(-2., 20.), Some(ResizeEdge::LEFT));
+    // No border: only the gap outside.
+    let at = |x: f64, y: f64| edge_resize_edges(size, 0., 6., 16., Point::from((x, y)));
+    assert_eq!(at(0.5, 150.), None);
+    assert_eq!(at(-0.5, 150.), Some(ResizeEdge::LEFT));
+}
+
+#[test]
+fn edge_resize_follows_config() {
+    use crate::utils::ResizeEdge;
+
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::Communicate(0),
+    ];
+    let options = Options {
+        layout: niri_config::Layout {
+            border: niri_config::Border {
+                off: false,
+                width: 2.,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let layout = check_ops_with_options(options, ops);
+    let tile = layout.active_workspace().unwrap().tiles().next().unwrap();
+    let h = tile.tile_size().h;
+
+    // Defaults: 12 outside, the 2 px border and 4 inside, 28 px corners.
+    let at = |x: f64, y: f64| tile.edge_resize_edges(Point::from((x, y)));
+    assert_eq!(at(-11., h / 2.), Some(ResizeEdge::LEFT));
+    assert_eq!(at(-13., h / 2.), None);
+    assert_eq!(at(5., h / 2.), Some(ResizeEdge::LEFT));
+    assert_eq!(at(7., h / 2.), None);
+    assert_eq!(at(-3., 27.), Some(ResizeEdge::TOP_LEFT));
+    assert_eq!(at(-3., 29.), Some(ResizeEdge::LEFT));
+    // The band inside the edge is niri's, not the window's.
+    assert!(matches!(
+        tile.hit(Point::from((5., h / 2.))),
+        Some(HitType::Activate { titlebar: None, .. })
+    ));
+}
+
+#[test]
 fn tabs_with_different_border() {
     let ops = [
         Op::AddOutput(1),
@@ -3839,6 +4166,20 @@ prop_compose! {
 }
 
 prop_compose! {
+    fn arbitrary_titlebar()(
+        off in any::<bool>(),
+        height in prop::option::of(arbitrary_spacing().prop_map(FloatOrInt)),
+    ) -> niri_config::TitlebarRule {
+        niri_config::TitlebarRule {
+            off,
+            on: !off,
+            height,
+            ..Default::default()
+        }
+    }
+}
+
+prop_compose! {
     fn arbitrary_shadow()(
         off in any::<bool>(),
         softness in prop::option::of(arbitrary_spacing().prop_map(FloatOrInt)),
@@ -3885,6 +4226,7 @@ prop_compose! {
         border in prop::option::of(arbitrary_border()),
         shadow in prop::option::of(arbitrary_shadow()),
         tab_indicator in prop::option::of(arbitrary_tab_indicator()),
+        titlebar in prop::option::of(arbitrary_titlebar()),
         center_focused_column in prop::option::of(arbitrary_center_focused_column()),
         always_center_single_column in prop::option::of(any::<bool>().prop_map(Flag)),
         empty_workspace_above_first in prop::option::of(any::<bool>().prop_map(Flag)),
@@ -3899,6 +4241,7 @@ prop_compose! {
             border,
             shadow,
             tab_indicator,
+            titlebar,
             ..Default::default()
         }
     }
@@ -3928,4 +4271,117 @@ proptest! {
 
         check_ops_with_options(options, ops);
     }
+}
+
+#[test]
+fn overview_pinch_rubber_bands_and_snaps_back() {
+    let mut layout = check_ops([Op::AddOutput(1), Op::ToggleOverview, Op::CompleteAnimations]);
+    let min_scale = OVERVIEW_PINCH_MIN_ZOOM / 0.5;
+
+    // Zooming far out overshoots the limit, but only by a bounded amount.
+    assert!(layout.overview_pinch_begin());
+    layout.overview_pinch_update(0.001).unwrap();
+    let banded = layout.overview_zoom_scale;
+    assert!(banded < min_scale);
+    assert!(banded > min_scale * (-OVERVIEW_PINCH_RUBBER_BAND.limit).exp());
+    layout.verify_invariants();
+
+    // Releasing springs back to the limit.
+    assert!(layout.overview_pinch_end());
+    assert!(layout.are_animations_ongoing(None));
+    check_ops_on_layout(&mut layout, [Op::AdvanceAnimations { msec_delta: 5000 }]);
+    assert!((layout.overview_zoom_scale - min_scale).abs() < 1e-9);
+    assert!(!layout.are_animations_ongoing(None));
+
+    // Pinching in goes up to the workspaces' full size (zoom 1, scale 1 / 0.5) and past it
+    // only by the rubber band, never closing the overview.
+    let max_scale = 1. / 0.5;
+    assert!(layout.overview_pinch_begin());
+    layout.overview_pinch_update(1000.).unwrap();
+    assert!(layout.overview_zoom_scale > max_scale);
+    assert!(layout.overview_pinch_end());
+    check_ops_on_layout(&mut layout, [Op::AdvanceAnimations { msec_delta: 5000 }]);
+    assert!((layout.overview_zoom_scale - max_scale).abs() < 1e-9);
+    assert!((layout.overview_zoom() - 1.).abs() < 1e-9);
+    assert!(layout.is_overview_open());
+}
+
+#[test]
+fn ipc_view_column_follows_gesture() {
+    use crate::layout::scrolling::IpcViewColumn;
+
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::CompleteAnimations,
+    ];
+    let mut layout = check_ops(ops);
+    let column = |layout: &Layout<TestWindow>| {
+        layout
+            .active_workspace()
+            .unwrap()
+            .scrolling()
+            .ipc_view_column()
+    };
+    assert_eq!(column(&layout), Some(IpcViewColumn::Static(2)));
+
+    let ops = [
+        Op::ViewOffsetGestureBegin {
+            output_idx: 1,
+            workspace_idx: None,
+            is_touchpad: false,
+        },
+        Op::ViewOffsetGestureUpdate {
+            delta: 0.,
+            timestamp: Duration::from_millis(10),
+            is_touchpad: false,
+        },
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column(&layout), Some(IpcViewColumn::Gesture(2.)));
+
+    // Back towards the first column: part of the way.
+    check_ops_on_layout(
+        &mut layout,
+        [Op::ViewOffsetGestureUpdate {
+            delta: -20.,
+            timestamp: Duration::from_millis(20),
+            is_touchpad: false,
+        }],
+    );
+    let Some(IpcViewColumn::Gesture(pos)) = column(&layout) else {
+        panic!("expected a gesture");
+    };
+    assert!(1. < pos && pos < 2., "{pos}");
+
+    // Past the first column: holds on it.
+    check_ops_on_layout(
+        &mut layout,
+        [Op::ViewOffsetGestureUpdate {
+            delta: -100000.,
+            timestamp: Duration::from_millis(30),
+            is_touchpad: false,
+        }],
+    );
+    assert_eq!(column(&layout), Some(IpcViewColumn::Gesture(0.)));
+
+    // Released: animates to the column it snaps to.
+    check_ops_on_layout(
+        &mut layout,
+        [Op::ViewOffsetGestureEnd {
+            is_touchpad: Some(false),
+        }],
+    );
+    assert!(matches!(
+        column(&layout),
+        Some(IpcViewColumn::Animation { column: 0, .. })
+    ));
 }

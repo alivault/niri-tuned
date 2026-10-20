@@ -85,7 +85,9 @@ pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
 pub mod tile;
+pub mod titlebar;
 pub mod workspace;
+pub mod workspace_highlight;
 
 #[cfg(test)]
 mod tests;
@@ -209,6 +211,7 @@ pub trait LayoutElement {
         _surface_anim_scale: Scale<f64>,
         _radius: CornerRadius,
         _xray_pos: XrayPos,
+        _above: Option<(f64, CornerRadius)>,
         _push: &mut dyn FnMut(BackgroundEffectElement),
     ) {
     }
@@ -234,6 +237,14 @@ pub trait LayoutElement {
     fn max_size(&self) -> Size<i32, Logical>;
     fn is_wl_surface(&self, wl_surface: &WlSurface) -> bool;
     fn has_ssd(&self) -> bool;
+    /// The window's title, for its server-side title bar.
+    fn title(&self) -> Option<String> {
+        None
+    }
+    /// Whether the window is floating, for its title bar's float button.
+    fn is_floating(&self) -> bool {
+        false
+    }
     fn set_preferred_scale_transform(&self, scale: output::Scale, transform: Transform);
     fn output_enter(&self, output: &Output);
     fn output_leave(&self, output: &Output);
@@ -364,6 +375,14 @@ pub struct Layout<W: LayoutElement> {
     overview_open: bool,
     /// The overview zoom progress.
     overview_progress: Option<OverviewProgress>,
+    /// Extra multiplier on the overview zoom, adjusted by pinching while the overview is open.
+    ///
+    /// 1.0 means the configured zoom. Reset when the overview fully closes.
+    overview_zoom_scale: f64,
+    /// Zoom scale at the start of the current overview pinch gesture.
+    overview_pinch_start: Option<f64>,
+    /// Snap-back of the overview zoom scale after a rubber-banded pinch.
+    overview_zoom_anim: Option<Animation>,
     /// Configurable properties of the layout.
     options: Rc<Options>,
 }
@@ -523,6 +542,10 @@ pub enum AddWindowTarget<'a, W: LayoutElement> {
     Workspace(WorkspaceId),
     /// Next to this existing window.
     NextTo(&'a W::Id),
+    /// On this workspace, as a new column at this 0-based index.
+    WorkspaceColumn(WorkspaceId, usize),
+    /// Into the column of this existing window, at this 0-based position in it.
+    InColumn(&'a W::Id, usize),
 }
 
 /// Type of the window hit from `window_under()`.
@@ -539,6 +562,8 @@ pub enum HitType {
     Activate {
         /// Whether the hit was on the tab indicator.
         is_tab_indicator: bool,
+        /// The part of the window's title bar that was hit, if any.
+        titlebar: Option<titlebar::TitlebarPart>,
     },
 }
 
@@ -640,6 +665,7 @@ impl HitType {
         match self {
             HitType::Input { .. } => HitType::Activate {
                 is_tab_indicator: false,
+                titlebar: None,
             },
             HitType::Activate { .. } => self,
         }
@@ -703,6 +729,9 @@ impl<W: LayoutElement> Layout<W> {
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
             overview_progress: None,
+            overview_zoom_scale: 1.,
+            overview_pinch_start: None,
+            overview_zoom_anim: None,
             options: Rc::new(options),
         }
     }
@@ -728,6 +757,9 @@ impl<W: LayoutElement> Layout<W> {
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
             overview_progress: None,
+            overview_zoom_scale: 1.,
+            overview_pinch_start: None,
+            overview_zoom_anim: None,
             options: opts,
         }
     }
@@ -808,7 +840,10 @@ impl<W: LayoutElement> Layout<W> {
                     layout_config,
                 );
                 monitor.overview_open = self.overview_open;
-                monitor.set_overview_progress(self.overview_progress.as_ref());
+                monitor.set_overview_progress(
+                    self.overview_progress.as_ref(),
+                    self.overview_zoom_scale,
+                );
                 monitors.push(monitor);
 
                 MonitorSet::Normal {
@@ -829,7 +864,10 @@ impl<W: LayoutElement> Layout<W> {
                     layout_config,
                 );
                 monitor.overview_open = self.overview_open;
-                monitor.set_overview_progress(self.overview_progress.as_ref());
+                monitor.set_overview_progress(
+                    self.overview_progress.as_ref(),
+                    self.overview_zoom_scale,
+                );
 
                 MonitorSet::Normal {
                     monitors: vec![monitor],
@@ -944,8 +982,54 @@ impl<W: LayoutElement> Layout<W> {
                 active_monitor_idx,
                 ..
             } => {
+                let mut target = target;
+                if let AddWindowTarget::InColumn(next_to, tile_idx) = target {
+                    let found = monitors.iter().enumerate().find_map(|(mon_idx, mon)| {
+                        mon.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
+                            ws.tiles_with_ipc_layouts()
+                                .find(|(tile, _)| tile.window().id() == next_to)
+                                .and_then(|(_, layout)| layout.pos_in_scrolling_layout)
+                                .map(|(col, _)| (mon_idx, ws_idx, col - 1))
+                        })
+                    });
+                    if let Some((mon_idx, ws_idx, col_idx)) = found {
+                        let activate = activate.map_smart(|| false);
+                        let mon = &mut monitors[mon_idx];
+                        let tile = mon.workspaces[ws_idx].make_tile(window);
+                        mon.add_tile_to_column(
+                            ws_idx,
+                            col_idx,
+                            Some(tile_idx),
+                            tile,
+                            activate,
+                            true,
+                        );
+                        if activate {
+                            *active_monitor_idx = mon_idx;
+                        }
+                        return Some(&monitors[mon_idx].output);
+                    }
+                    // The column is gone (or floating): open as usual.
+                    target = AddWindowTarget::Auto;
+                }
+
                 let (mon_idx, target) = match target {
                     AddWindowTarget::Auto => (*active_monitor_idx, MonitorAddWindowTarget::Auto),
+                    AddWindowTarget::InColumn(..) => unreachable!(),
+                    AddWindowTarget::WorkspaceColumn(ws_id, column_idx) => {
+                        let mon_idx = monitors
+                            .iter()
+                            .position(|mon| mon.workspaces.iter().any(|ws| ws.id() == ws_id))
+                            .unwrap();
+
+                        (
+                            mon_idx,
+                            MonitorAddWindowTarget::Workspace {
+                                id: ws_id,
+                                column_idx: Some(column_idx),
+                            },
+                        )
+                    }
                     AddWindowTarget::Output(output) => {
                         let mon_idx = monitors
                             .iter()
@@ -1046,9 +1130,25 @@ impl<W: LayoutElement> Layout<W> {
                         (0, WorkspaceAddWindowTarget::Auto)
                     }
                     AddWindowTarget::Output(_) => panic!(),
-                    AddWindowTarget::Workspace(ws_id) => {
+                    AddWindowTarget::Workspace(ws_id)
+                    | AddWindowTarget::WorkspaceColumn(ws_id, _) => {
                         let ws_idx = workspaces.iter().position(|ws| ws.id() == ws_id).unwrap();
                         (ws_idx, WorkspaceAddWindowTarget::Auto)
+                    }
+                    AddWindowTarget::InColumn(next_to, _) => {
+                        let ws_idx = workspaces.iter().position(|ws| ws.has_window(next_to));
+                        match ws_idx {
+                            Some(ws_idx) => (ws_idx, WorkspaceAddWindowTarget::NextTo(next_to)),
+                            None => {
+                                if workspaces.is_empty() {
+                                    workspaces.push(Workspace::new_no_outputs(
+                                        self.clock.clone(),
+                                        self.options.clone(),
+                                    ));
+                                }
+                                (0, WorkspaceAddWindowTarget::Auto)
+                            }
+                        }
                     }
                     AddWindowTarget::NextTo(next_to) => {
                         if self
@@ -1273,6 +1373,46 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         None
+    }
+
+    /// Workspace, 0-based column and 0-based position in it of a tiled window.
+    pub fn scrolling_position(&self, window: &W::Id) -> Option<(WorkspaceId, usize, usize)> {
+        self.workspaces().find_map(|(_, _, ws)| {
+            ws.tiles_with_ipc_layouts()
+                .find(|(tile, _)| tile.window().id() == window)
+                .and_then(|(_, layout)| layout.pos_in_scrolling_layout)
+                .map(|(col, tile)| (ws.id(), col - 1, tile - 1))
+        })
+    }
+
+    /// Ids of the workspaces on an output's monitor, top to bottom.
+    pub fn workspace_ids_on(&self, output: &Output) -> Vec<WorkspaceId> {
+        self.monitor_for_output(output)
+            .map(|mon| mon.workspaces.iter().map(|ws| ws.id()).collect())
+            .unwrap_or_default()
+    }
+
+    /// An empty workspace on an output's monitor: a new one inserted at `idx`, or with `None`
+    /// the monitor's last one (which is always empty).
+    pub fn empty_workspace_on(
+        &mut self,
+        output: &Output,
+        idx: Option<usize>,
+    ) -> Option<WorkspaceId> {
+        let mon = self.monitor_for_output_mut(output)?;
+        let idx = match idx {
+            Some(mut idx) => {
+                // Keep the empty workspace above the first one, if there is one.
+                if mon.options.layout.empty_workspace_above_first {
+                    idx = idx.max(1);
+                }
+                let idx = idx.min(mon.workspaces.len());
+                mon.add_workspace_at(idx);
+                idx
+            }
+            None => mon.workspaces.len() - 1,
+        };
+        Some(mon.workspaces[idx].id())
     }
 
     pub fn find_workspace_by_name(&self, workspace_name: &str) -> Option<(usize, &Workspace<W>)> {
@@ -1744,6 +1884,14 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         Some(&monitors[*active_monitor_idx])
+    }
+
+    /// Every monitor's view target (Monitor::view_target), then whether the overview is open:
+    /// changes when a view scrolls, switches workspace or the overview opens or closes.
+    pub fn view_targets(&self) -> Vec<(f64, f64)> {
+        let mut targets: Vec<_> = self.monitors().map(|mon| mon.view_target()).collect();
+        targets.push((if self.overview_open { 1. } else { 0. }, 0.));
+        targets
     }
 
     pub fn monitors(&self) -> impl Iterator<Item = &Monitor<W>> + '_ {
@@ -2341,6 +2489,19 @@ impl<W: LayoutElement> Layout<W> {
         mon.resize_edges_under(pos_within_output)
     }
 
+    /// The window whose edge is at `pos_within_output`, for resizing by dragging it.
+    pub fn edge_resize_under(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, ResizeEdge)> {
+        if self.interactive_move.is_some() {
+            return None;
+        }
+        let mon = self.monitor_for_output(output)?;
+        mon.edge_resize_under(pos_within_output)
+    }
+
     pub fn workspace_under(
         &self,
         extended_bounds: bool,
@@ -2364,7 +2525,72 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn overview_zoom(&self) -> f64 {
         let progress = self.overview_progress.as_ref().map(|p| p.value());
-        compute_overview_zoom(&self.options, progress)
+        compute_overview_zoom(&self.options, progress, self.overview_zoom_scale)
+    }
+
+    /// Starts a pinch gesture that zooms the open overview. Returns whether it was started.
+    pub fn overview_pinch_begin(&mut self) -> bool {
+        if !self.overview_open {
+            return false;
+        }
+        // Grab the zoom where it is, even mid snap-back.
+        self.overview_zoom_anim = None;
+        self.overview_pinch_start = Some(self.overview_zoom_scale);
+        true
+    }
+
+    /// Allowed range of the overview zoom scale, as natural logarithms: out to
+    /// OVERVIEW_PINCH_MIN_ZOOM, in to the workspaces' full size.
+    fn overview_zoom_scale_log_bounds(&self) -> (f64, f64) {
+        let base = self.options.overview.zoom.clamp(0.0001, 0.75);
+        let min_scale = (OVERVIEW_PINCH_MIN_ZOOM / base).min(1.);
+        let max_scale = (1. / base).max(1.);
+        (min_scale.ln(), max_scale.ln())
+    }
+
+    /// Updates the overview pinch with the cumulative libinput pinch scale.
+    ///
+    /// Returns `None` if no overview pinch is ongoing, otherwise whether anything changed.
+    pub fn overview_pinch_update(&mut self, pinch_scale: f64) -> Option<bool> {
+        let start = self.overview_pinch_start?;
+        if !self.overview_open {
+            return Some(false);
+        }
+
+        // Pinching is multiplicative, so rubber-band in log space: past either limit the zoom
+        // keeps following the fingers with growing resistance, then springs back on release.
+        let (min, max) = self.overview_zoom_scale_log_bounds();
+        let raw = start.ln() + pinch_scale.max(0.0001).ln();
+        let new_scale = OVERVIEW_PINCH_RUBBER_BAND.clamp(min, max, raw).exp();
+
+        if new_scale == self.overview_zoom_scale {
+            return Some(false);
+        }
+
+        self.overview_zoom_scale = new_scale;
+        self.set_monitors_overview_state();
+        Some(true)
+    }
+
+    /// Ends the overview pinch. Returns whether an overview pinch was ongoing.
+    pub fn overview_pinch_end(&mut self) -> bool {
+        if self.overview_pinch_start.take().is_none() {
+            return false;
+        }
+
+        let (min, max) = self.overview_zoom_scale_log_bounds();
+        let current = self.overview_zoom_scale.ln();
+        let target = current.clamp(min, max);
+        if current != target && self.overview_open {
+            self.overview_zoom_anim = Some(Animation::new(
+                self.clock.clone(),
+                current,
+                target,
+                0.,
+                self.options.animations.overview_open_close.0,
+            ));
+        }
+        true
     }
 
     #[cfg(test)]
@@ -2699,12 +2925,22 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        if let Some(anim) = &self.overview_zoom_anim {
+            self.overview_zoom_scale = anim.value().exp();
+            if anim.is_done() {
+                self.overview_zoom_anim = None;
+            }
+        }
+
         if let Some(OverviewProgress::Animation(anim)) = &mut self.overview_progress {
             if anim.is_done() {
                 if self.overview_open {
                     self.overview_progress = Some(OverviewProgress::Open);
                 } else {
                     self.overview_progress = None;
+                    self.overview_zoom_scale = 1.;
+                    self.overview_pinch_start = None;
+                    self.overview_zoom_anim = None;
                 }
             }
         }
@@ -2712,7 +2948,10 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
-                    mon.set_overview_progress(self.overview_progress.as_ref());
+                    mon.set_overview_progress(
+                        self.overview_progress.as_ref(),
+                        self.overview_zoom_scale,
+                    );
                     mon.advance_animations();
                 }
             }
@@ -2749,6 +2988,7 @@ impl<W: LayoutElement> Layout<W> {
             .overview_progress
             .as_ref()
             .is_some_and(|p| p.is_animation())
+            || self.overview_zoom_anim.is_some()
         {
             return true;
         }
@@ -2810,7 +3050,10 @@ impl<W: LayoutElement> Layout<W> {
                 let is_active = self.is_active
                     && idx == *active_monitor_idx
                     && !matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_)));
-                mon.set_overview_progress(self.overview_progress.as_ref());
+                mon.set_overview_progress(
+                    self.overview_progress.as_ref(),
+                    self.overview_zoom_scale,
+                );
                 mon.update_render_elements(is_active);
             }
         }
@@ -4589,7 +4832,7 @@ impl<W: LayoutElement> Layout<W> {
 
         for mon in monitors {
             mon.overview_open = self.overview_open;
-            mon.set_overview_progress(self.overview_progress.as_ref());
+            mon.set_overview_progress(self.overview_progress.as_ref(), self.overview_zoom_scale);
         }
     }
 
@@ -4955,6 +5198,22 @@ impl<W: LayoutElement> Layout<W> {
         iter_normal.chain(iter_no_outputs)
     }
 
+    /// Marks the hovered title bar button of `window`, and clears it everywhere else.
+    ///
+    /// Returns whether anything changed.
+    pub fn set_titlebar_hover(&mut self, hover: Option<(&W::Id, titlebar::TitlebarPart)>) -> bool {
+        let mut changed = false;
+        for ws in self.workspaces_mut() {
+            for tile in ws.tiles_mut() {
+                let part = hover
+                    .filter(|(id, _)| tile.window().id() == *id)
+                    .map(|(_, part)| part);
+                changed |= tile.set_titlebar_hovered(part);
+            }
+        }
+        changed
+    }
+
     pub fn workspaces_mut(&mut self) -> impl Iterator<Item = &mut Workspace<W>> + '_ {
         let iter_normal;
         let iter_no_outputs;
@@ -5011,9 +5270,18 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
     }
 }
 
-fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f64 {
+/// Smallest overview zoom reachable by pinching.
+const OVERVIEW_PINCH_MIN_ZOOM: f64 = 0.15;
+
+/// Pinch overshoot past the zoom limits, in natural-log units (0.2 is about 22%).
+const OVERVIEW_PINCH_RUBBER_BAND: RubberBand = RubberBand {
+    stiffness: 0.5,
+    limit: 0.2,
+};
+
+fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>, scale: f64) -> f64 {
     // Clamp to some sane values.
-    let zoom = options.overview.zoom.clamp(0.0001, 0.75);
+    let zoom = (options.overview.zoom.clamp(0.0001, 0.75) * scale).max(0.0001);
 
     if let Some(p) = overview_progress {
         (1. - p * (1. - zoom)).max(0.0001)

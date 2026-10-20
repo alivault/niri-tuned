@@ -1,10 +1,11 @@
-use std::cell::RefCell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::{env, io, process};
 
 use anyhow::Context;
@@ -17,8 +18,8 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Action, Event, KeyboardLayouts, OutputConfigChanged, OutputView, Overview, Reply, Request,
+    Response, Timestamp, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -32,6 +33,7 @@ use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
 
 use crate::backend::IpcOutputMap;
 use crate::input::pick_window_grab::PickWindowGrab;
+use crate::layout::scrolling::IpcViewColumn;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
 use crate::utils::{version, with_toplevel_role};
@@ -48,14 +50,33 @@ pub struct IpcServer {
     pub socket_path: Option<PathBuf>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    view_streams: Rc<RefCell<Vec<ViewStreamSender>>>,
+    view_state: Rc<RefCell<ViewStreamState>>,
 }
 
 struct ClientCtx {
+    nightlight_id: u64,
+    nightlight_used: Cell<bool>,
     event_loop: LoopHandle<'static, State>,
     scheduler: Scheduler<()>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    view_streams: Rc<RefCell<Vec<ViewStreamSender>>>,
+    view_state: Rc<RefCell<ViewStreamState>>,
+}
+
+impl Drop for ClientCtx {
+    fn drop(&mut self) {
+        if self.nightlight_used.get() {
+            let id = self.nightlight_id;
+            self.event_loop.insert_idle(move |state| {
+                if let Some(tty) = state.backend.tty_checked() {
+                    tty.release_nightlight(id);
+                }
+            });
+        }
+    }
 }
 
 struct EventStreamClient {
@@ -67,6 +88,27 @@ struct EventStreamClient {
 struct EventStreamSender {
     events: Sender<Event>,
     disconnect: Sender<()>,
+}
+
+/// A view stream client: the newest line, and a wakeup. Never a queue, so a slow reader skips
+/// to the newest state instead of falling behind.
+struct ViewStreamSender {
+    latest: Rc<RefCell<Option<Vec<u8>>>>,
+    wake: Sender<()>,
+}
+
+#[derive(Default)]
+struct ViewStreamState {
+    /// The last line sent.
+    line: Vec<u8>,
+    /// Per active workspace: its last column, and the animation running and where it began.
+    columns: HashMap<u64, ColumnTrack>,
+}
+
+#[derive(Default)]
+struct ColumnTrack {
+    last: Option<f64>,
+    animation: Option<(Duration, f64)>,
 }
 
 impl IpcServer {
@@ -109,6 +151,8 @@ impl IpcServer {
             socket_path,
             event_streams: Rc::new(RefCell::new(Vec::new())),
             event_stream_state: Rc::new(RefCell::new(EventStreamState::default())),
+            view_streams: Rc::new(RefCell::new(Vec::new())),
+            view_state: Rc::new(RefCell::new(ViewStreamState::default())),
         })
     }
 
@@ -167,11 +211,18 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
     let ipc_server = state.niri.ipc_server.as_ref().unwrap();
 
     let ctx = ClientCtx {
+        nightlight_id: {
+            static IDS: crate::utils::id::IdCounter = crate::utils::id::IdCounter::new();
+            IDS.next()
+        },
+        nightlight_used: Cell::new(false),
         event_loop: state.niri.event_loop.clone(),
         scheduler: state.niri.scheduler.clone(),
         ipc_outputs: state.backend.ipc_outputs(),
         event_streams: ipc_server.event_streams.clone(),
         event_stream_state: ipc_server.event_stream_state.clone(),
+        view_streams: ipc_server.view_streams.clone(),
+        view_state: ipc_server.view_state.clone(),
     };
 
     let future = async move {
@@ -207,6 +258,7 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
             .map_err(|err| err.to_string());
         let requested_error = matches!(request, Ok(Request::ReturnError));
         let requested_event_stream = matches!(request, Ok(Request::EventStream));
+        let requested_view_stream = matches!(request, Ok(Request::ViewStream));
 
         let reply = match request {
             Ok(request) => process(&ctx, request).await,
@@ -224,7 +276,30 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
         buf.push(b'\n');
         write.write_all(&buf).await.context("error writing reply")?;
 
-        if requested_event_stream {
+        if requested_view_stream && reply.is_ok() {
+            let line = ctx.view_state.borrow().line.clone();
+            let latest = Rc::new(RefCell::new((!line.is_empty()).then_some(line)));
+            let (wake_tx, wake_rx) = async_channel::bounded(1);
+            if latest.borrow().is_some() {
+                let _ = wake_tx.try_send(());
+            }
+            let future = handle_view_stream_client(latest.clone(), wake_rx, Box::new(write));
+            let future = async move {
+                if let Err(err) = future.await {
+                    warn!("error handling IPC view stream client: {err:?}");
+                }
+            };
+            if let Err(err) = ctx.scheduler.schedule(future) {
+                warn!("error scheduling IPC view stream future: {err:?}");
+            }
+            ctx.view_streams.borrow_mut().push(ViewStreamSender {
+                latest,
+                wake: wake_tx,
+            });
+            return Ok(());
+        }
+
+        if requested_event_stream && reply.is_ok() {
             let (events_tx, events_rx) = async_channel::bounded(EVENT_STREAM_BUFFER_SIZE);
             let (disconnect_tx, disconnect_rx) = async_channel::bounded(1);
 
@@ -270,6 +345,34 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
 
 async fn process(ctx: &ClientCtx, request: Request) -> Reply {
     let response = match request {
+        Request::Nightlight { enabled } => {
+            let id = ctx.nightlight_id;
+            if enabled.is_some() {
+                ctx.nightlight_used.set(true);
+            }
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let result = if let Some(tty) = state.backend.tty_checked() {
+                    tty.nightlight_request(id, enabled).map_err(|err| format!("{err:#}"))
+                } else if enabled.is_some() {
+                    Err("CTM nightlight requires a native DRM output, not a nested/headless session".into())
+                } else {
+                    Ok(niri_ipc::NightlightStatus {
+                        backend: "drm-ctm-v1".into(), supported: false, enabled: None,
+                        desired: false, session_active: false, temperature: None, outputs: Vec::new(),
+                        generation: 0, cleanup_pending: false,
+                        error: "No native DRM outputs in this session".into(),
+                    })
+                };
+                let _ = tx.send_blocking(result);
+            });
+            // Reply only after the blocking DRM commit AND matrix readback.
+            let status = rx
+                .recv()
+                .await
+                .map_err(|_| "nightlight compositor reply lost".to_owned())??;
+            Response::Nightlight(status)
+        }
         Request::ReturnError => return Err(String::from("example compositor error")),
         Request::Version => Response::Version(version()),
         Request::Outputs => {
@@ -444,11 +547,38 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let output = result.map_err(|_| String::from("error getting active output info"))?;
             Response::FocusedOutput(output)
         }
-        Request::EventStream => Response::Handled,
+        Request::EventStream => {
+            // A request socket that has used the CTM lease remains a request
+            // socket. Do not transfer it and drop its live cleanup guard.
+            // Conservative even after disable/failure; use a second connection
+            // for events. Returning Err must NOT enter the transfer branch.
+            if ctx.nightlight_used.get() {
+                return Err("EventStream cannot replace a nightlight lease connection; open a separate socket".into());
+            }
+            Response::Handled
+        }
+        Request::ViewStream => {
+            // As EventStream: a nightlight lease connection stays a request socket.
+            if ctx.nightlight_used.get() {
+                return Err("ViewStream cannot replace a nightlight lease connection; open a separate socket".into());
+            }
+            Response::Handled
+        }
         Request::OverviewState => {
             let state = ctx.event_stream_state.borrow();
             let is_open = state.overview.is_open;
             Response::OverviewState(Overview { is_open })
+        }
+        Request::PlaceWindows(request) => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                crate::window_placement::start(state, request);
+                let _ = tx.send_blocking(());
+            });
+            rx.recv()
+                .await
+                .map_err(|_| "placement reply lost".to_owned())?;
+            Response::Handled
         }
         Request::Casts => {
             let state = ctx.event_stream_state.borrow();
@@ -509,6 +639,25 @@ async fn handle_event_stream_client(client: EventStreamClient) -> anyhow::Result
         }
     }
 
+    Ok(())
+}
+
+async fn handle_view_stream_client(
+    latest: Rc<RefCell<Option<Vec<u8>>>>,
+    wake: Receiver<()>,
+    mut write: Box<dyn AsyncWrite + Unpin>,
+) -> anyhow::Result<()> {
+    while wake.recv().await.is_ok() {
+        let Some(buf) = latest.borrow_mut().take() else {
+            continue;
+        };
+        match write.write_all(&buf).await {
+            Ok(()) => (),
+            // Normal client disconnection.
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+            res @ Err(_) => res.context("error writing view")?,
+        }
+    }
     Ok(())
 }
 
@@ -804,6 +953,84 @@ impl State {
         let event = Event::OverviewOpenedOrClosed { is_open };
         state.apply(event.clone());
         server.send_event(event);
+    }
+
+    /// Sends each output's view (workspace and column, fractional while they move) to view
+    /// stream clients when it changed.
+    pub fn ipc_refresh_views(&mut self) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        let round = |x: f64| (x * 10000.).round() / 10000.;
+        let mut state = server.view_state.borrow_mut();
+        let mut views = Vec::new();
+        let mut active = HashSet::new();
+        for mon in self.niri.layout.monitors() {
+            let ws = mon.active_workspace_ref();
+            let id = ws.id().get();
+            active.insert(id);
+            let track = state.columns.entry(id).or_default();
+            let (column, scrolling) = match ws.ipc_view_column() {
+                None => {
+                    track.animation = None;
+                    (None, false)
+                }
+                Some(IpcViewColumn::Static(column)) => {
+                    track.animation = None;
+                    (Some(column as f64), false)
+                }
+                Some(IpcViewColumn::Gesture(pos)) => {
+                    track.animation = None;
+                    (Some(pos), true)
+                }
+                Some(IpcViewColumn::Animation {
+                    column,
+                    progress,
+                    start,
+                }) => {
+                    let to = column as f64;
+                    // From where the column was when this animation started.
+                    let from = match track.animation {
+                        Some((started, from)) if started == start => from,
+                        _ => {
+                            let from = track.last.unwrap_or(to);
+                            track.animation = Some((start, from));
+                            from
+                        }
+                    };
+                    (Some(from + (to - from) * progress), true)
+                }
+            };
+            track.last = column.or(track.last);
+            views.push(OutputView {
+                output: mon.output_name().clone(),
+                workspace: round(mon.workspace_render_idx() + 1.),
+                switching: mon.is_workspace_switch_ongoing(),
+                workspace_id: Some(id),
+                column: column.map(|c| round(c + 1.)),
+                scrolling,
+            });
+        }
+        state.columns.retain(|id, _| active.contains(id));
+
+        let mut line = match serde_json::to_vec(&views) {
+            Ok(line) => line,
+            Err(err) => {
+                warn!("error formatting views: {err:?}");
+                return;
+            }
+        };
+        line.push(b'\n');
+        if line == state.line {
+            return;
+        }
+        state.line = line;
+
+        server.view_streams.borrow_mut().retain(|stream| {
+            *stream.latest.borrow_mut() = Some(state.line.clone());
+            !matches!(stream.wake.try_send(()), Err(TrySendError::Closed(_)))
+        });
     }
 
     pub fn ipc_refresh_casts(&mut self) {

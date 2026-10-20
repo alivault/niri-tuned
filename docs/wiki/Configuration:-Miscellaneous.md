@@ -35,6 +35,24 @@ overview {
         offset x=0 y=10
         color "#00000050"
     }
+
+    backdrop-blur {
+        // on
+        radius 32
+        noise 0.02
+        saturation 1.5
+    }
+
+    workspace-highlight {
+        // on
+        border-width 1
+        fill-color "#ffffff"
+        fill-opacity 0.06
+        active-border-color "#ffffff"
+        active-border-opacity 0.5
+        inactive-border-color "#ffffff"
+        inactive-border-opacity 0.19
+    }
 }
 
 xwayland-satellite {
@@ -115,6 +133,40 @@ With `prefer-no-csd` set, applications that negotiate server-side decorations th
 ```kdl
 prefer-no-csd
 ```
+
+### `screenshot-ui` (tuned build)
+
+The tuned build adds preferences for the native screenshot selector:
+
+```kdl
+screenshot-ui {
+    remember-selection false
+    show-panel false
+    show-pointer false
+    capture-on-release true
+}
+```
+
+These are the defaults in this build. Settings are read when opening the UI;
+config reloads apply to the next capture.
+
+- `remember-selection`: restore the previous rectangle. When false, no rectangle
+  is visible until you start selecting. Keyboard move/resize actions can also
+  create a selection; confirming before selecting does nothing.
+- `show-panel`: display the bottom help/capture panel. When false, the panel is
+  neither rendered nor clickable.
+- `show-pointer`: include the captured mouse pointer by default. An explicit
+  `screenshot show-pointer=true/false` binding or IPC flag overrides this setting.
+  **P** still toggles the captured pointer; the selection crosshair is unaffected.
+- `capture-on-release`: save and copy a non-zero-area drag when the selecting
+  mouse button, pen or touch is released. Clicks and line-only drags do not capture.
+  Releasing a secondary touch used to move the selection does not capture it.
+  Set false to retain the Enter/Space confirmation workflow. Ctrl+C copies only
+  when a selection exists (use manual confirmation mode for copy-only captures).
+
+To restore the upstream interaction, set `remember-selection`, `show-panel` and
+`show-pointer` to true, and `capture-on-release` to false. This section is not
+recognized by stock Niri 26.04; keep it in the tuned session's config only.
 
 ### `screenshot-path`
 
@@ -244,6 +296,63 @@ Practically, this means that you'll want bigger spread, offset, and softness com
 overview {
     workspace-shadow {
         off
+    }
+}
+```
+
+The shadow is drawn only outside the workspace, so it also suits transparent workspaces (a `background-color` with alpha 0 in the layout section, with the wallpaper [in the backdrop](./Configuration:-Layer-Rules.md#place-within-backdrop)).
+
+#### `backdrop-blur`
+
+<sup>niri-tuned</sup>
+
+Blur the backdrop (its color and the layer surfaces placed within it) in the overview.
+The blur grows with the overview: from sharp when it starts opening to `radius` once fully open, following the open and close animations and the touchpad gesture as it moves.
+It is a real blur increase, not a fade between a sharp and a blurred image (only the faintest start, below the smallest blur one pass can make, fades in).
+Noise and saturation grow with it.
+
+It is off by default; `on` turns it on.
+`radius` is in logical pixels, roughly how far the blur spreads at full strength.
+`noise` and `saturation` work as in the [`blur` section](./Configuration:-Miscellaneous.md#blur).
+
+Workspaces are drawn over the blur, so with transparent workspaces the blurred backdrop also shows through them; with opaque ones (or a wallpaper on each), only around them.
+
+```kdl
+overview {
+    backdrop-blur {
+        on
+        radius 48
+    }
+}
+```
+
+#### `workspace-highlight`
+
+<sup>niri-tuned</sup>
+
+Show each workspace's area in the overview: a fill inside it and a border around its outside, the workspace you're on with `active-border-color`, the others with `inactive-border-color`.
+Both fade in and out with the overview, so they never show in a workspace switch outside it.
+Useful with transparent workspaces, which otherwise have no visible edge.
+
+It is off by default; `on` turns it on.
+`border-width` is in screen pixels whatever the overview zoom (rounded to whole physical pixels; 0 for no border).
+The fill and the border are square, as the workspace is.
+
+Each colour and its opacity are separate settings: `fill-opacity`, `active-border-opacity` and `inactive-border-opacity` (0 to 1) are the only transparency, a colour's own alpha is ignored.
+So one file (a desktop's theme) can give the colours and another (the user's config) change an opacity alone, or the other way round, and each keeps following the file under it.
+The fill is drawn under the workspace's windows and background, so an opaque workspace hides it.
+
+```kdl
+overview {
+    workspace-highlight {
+        on
+        border-width 2
+        fill-color "#ffffff"
+        fill-opacity 0.06
+        active-border-color "#7fc8ff"
+        active-border-opacity 1
+        inactive-border-color "#ffffff"
+        inactive-border-opacity 0.25
     }
 }
 ```

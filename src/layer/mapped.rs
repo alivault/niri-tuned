@@ -45,6 +45,9 @@ pub struct MappedLayer {
     /// The blur config, passed for background effect rendering.
     blur_config: niri_config::Blur,
 
+    /// Animation for fading the surface's own blur region in and out.
+    blur_fade: niri_config::Animation,
+
     /// The view size for the layer surface's output.
     view_size: Size<f64, Logical>,
 
@@ -89,6 +92,7 @@ impl MappedLayer {
             scale,
             shadow: Shadow::new(shadow_config),
             blur_config: config.blur,
+            blur_fade: config.animations.blur_fade.0,
             clock,
         }
     }
@@ -101,6 +105,7 @@ impl MappedLayer {
         self.shadow.update_config(shadow_config);
 
         self.blur_config = config.blur;
+        self.blur_fade = config.animations.blur_fade.0;
     }
 
     pub fn update_shaders(&mut self) {
@@ -127,7 +132,7 @@ impl MappedLayer {
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.rules.baba_is_float
+        self.rules.baba_is_float || background_effect::is_fade_ongoing(self.surface.wl_surface())
     }
 
     pub fn surface(&self) -> &LayerSurface {
@@ -237,6 +242,10 @@ impl MappedLayer {
         let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.
         let surface_anim_scale = Scale::from(1.);
         let radius = self.rules.geometry_corner_radius.unwrap_or_default();
+        let fade = background_effect::BlurFade {
+            clock: self.clock.clone(),
+            config: self.blur_fade,
+        };
         background_effect::render_for_tile(
             ctx.as_gles(),
             ns,
@@ -251,6 +260,7 @@ impl MappedLayer {
             self.rules.background_effect,
             should_block_out,
             xray_pos,
+            Some(&fade),
             &mut |elem| push(elem.into()),
         );
     }
@@ -320,6 +330,7 @@ impl MappedLayer {
                 effect,
                 false,
                 xray_pos,
+                None,
                 &mut |elem| push(elem.into()),
             );
         }

@@ -100,6 +100,10 @@ pub struct SwitchAction {
 // Remember to add new actions to the CLI enum too.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub enum Action {
+    /// `Key { unbind; }`: drops an earlier binding of the key (one in an included defaults
+    /// file), so the key goes to the focused window again. Never stored: the binds merge
+    /// removes it with the binding it replaces.
+    Unbind,
     Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
     #[knuffel(skip)]
     ChangeVt(i32),
@@ -121,7 +125,7 @@ pub enum Action {
     #[knuffel(skip)]
     ScreenshotTogglePointer,
     Screenshot(
-        #[knuffel(property(name = "show-pointer"), default = true)] bool,
+        #[knuffel(property(name = "show-pointer"))] Option<bool>,
         // Path; not settable from knuffel
         Option<String>,
     ),
@@ -390,6 +394,8 @@ pub enum Action {
     MruSetScope(MruScope),
     #[knuffel(skip)]
     MruCycleScope,
+    #[knuffel(skip)]
+    MruSpawnForCurrentWindow(Vec<String>),
 }
 
 impl From<niri_ipc::Action> for Action {

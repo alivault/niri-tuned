@@ -14,6 +14,8 @@ pub struct Shaders {
     pub border: Option<ShaderProgram>,
     pub shadow: Option<ShaderProgram>,
     pub clipped_surface: Option<GlesTexProgram>,
+    pub thumbnail: Option<GlesTexProgram>,
+    pub projected_surface: Option<GlesTexProgram>,
     pub postprocess_and_clip: Option<GlesTexProgram>,
     pub resize: Option<ShaderProgram>,
     pub gradient_fade: Option<GlesTexProgram>,
@@ -104,6 +106,50 @@ impl Shaders {
             })
             .ok();
 
+        let thumbnail = renderer
+            .compile_custom_texture_shader(
+                concat!(
+                    include_str!("thumbnail.frag"),
+                    include_str!("rounding_alpha.frag")
+                ),
+                &[
+                    UniformName::new("niri_scale", UniformType::_1f),
+                    UniformName::new("geo_size", UniformType::_2f),
+                    UniformName::new("corner_radius", UniformType::_4f),
+                    UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                    UniformName::new("sample_area", UniformType::_2f),
+                    UniformName::new("sample_count", UniformType::_2f),
+                    UniformName::new("sample_bounds", UniformType::_4f),
+                ],
+            )
+            .map_err(|err| {
+                warn!("error compiling thumbnail shader; using linear filtering: {err:?}")
+            })
+            .ok();
+
+        let projected_surface = renderer
+            .compile_custom_texture_shader(
+                concat!(
+                    include_str!("projected_surface.frag"),
+                    include_str!("rounding_alpha.frag")
+                ),
+                &[
+                    UniformName::new("input_to_box", UniformType::Matrix3x3),
+                    UniformName::new("box_to_window", UniformType::Matrix3x3),
+                    UniformName::new("box_pixel", UniformType::_2f),
+                    UniformName::new("surface_rect", UniformType::_4f),
+                    UniformName::new("surface_to_input", UniformType::Matrix3x3),
+                    UniformName::new("surface_texels", UniformType::_2f),
+                    UniformName::new("surface_cut", UniformType::_4f),
+                    UniformName::new("geo_size", UniformType::_2f),
+                    UniformName::new("corner_radius", UniformType::_4f),
+                ],
+            )
+            .map_err(|err| {
+                warn!("error compiling projected surface shader: {err:?}");
+            })
+            .ok();
+
         let postprocess_and_clip = renderer
             .compile_custom_texture_shader(
                 concat!(
@@ -152,6 +198,8 @@ impl Shaders {
             border,
             shadow,
             clipped_surface,
+            thumbnail,
+            projected_surface,
             postprocess_and_clip,
             resize,
             gradient_fade,

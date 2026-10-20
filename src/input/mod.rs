@@ -48,12 +48,14 @@ use self::spatial_movement_grab::SpatialMovementGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::layout::titlebar::TitlebarPart;
+use crate::layout::{ActivateWindow, HitType, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
+use niri_config::TitlebarButton;
 
 pub mod backend_ext;
 pub mod move_grab;
@@ -121,6 +123,13 @@ impl State {
 
         // Make sure some logic like workspace clean-up has a chance to run before doing actions.
         self.niri.advance_animations();
+
+        // Windows still being restored no longer take focus once the user does something.
+        if is_user_action(&event) {
+            if let Some(placements) = &mut self.niri.window_placements {
+                placements.note_user_input();
+            }
+        }
 
         if self.niri.monitors_active {
             // Notify the idle-notifier of activity.
@@ -657,6 +666,8 @@ impl State {
         }
 
         match action {
+            // Removed with the binding it replaces when the config merges; never bound.
+            Action::Unbind => (),
             Action::Quit(skip_confirmation) => {
                 if !skip_confirmation && self.niri.exit_confirm_dialog.show() {
                     self.niri.queue_redraw_all();
@@ -2358,6 +2369,16 @@ impl State {
                     }
                 }
             }
+            Action::MruSpawnForCurrentWindow(command) => {
+                if self.niri.window_mru_ui.is_open() {
+                    if let Some(id) = self.niri.window_mru_ui.current_window_id() {
+                        let mut command = command;
+                        command.push(id.get().to_string());
+                        let (token, _) = self.niri.activation_state.create_external_token(None);
+                        spawn(command, Some(token.clone()));
+                    }
+                }
+            }
             Action::MruFirst => {
                 if self.niri.window_mru_ui.is_open() {
                     self.niri.window_mru_ui.first();
@@ -2580,6 +2601,7 @@ impl State {
         self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);
+        self.niri.update_titlebar_hover();
 
         pointer.motion(
             self,
@@ -2590,6 +2612,7 @@ impl State {
                 time: event.time_msec(),
             },
         );
+        self.niri.update_edge_resize_cursor(new_pos);
 
         pointer.relative_motion(
             self,
@@ -2683,6 +2706,7 @@ impl State {
         self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);
+        self.niri.update_titlebar_hover();
 
         pointer.motion(
             self,
@@ -2693,6 +2717,7 @@ impl State {
                 time: event.time_msec(),
             },
         );
+        self.niri.update_edge_resize_cursor(pos);
 
         pointer.frame(self);
 
@@ -2733,6 +2758,207 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Starts resizing `window` from `edges` with the pointer, as Mod+right-drag does; a double
+    /// click on a side toggles the column's full width, on the top or bottom resets the height.
+    fn begin_edge_resize(
+        &mut self,
+        window: smithay::desktop::Window,
+        edges: ResizeEdge,
+        button_code: u32,
+        serial: smithay::utils::Serial,
+    ) {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        let location = pointer.current_location();
+
+        let Some((_, mapped)) = self.niri.layout.windows().find(|(_, m)| m.window == window) else {
+            return;
+        };
+        let time = get_monotonic_time();
+        let last_cell = mapped.last_interactive_resize_start();
+        let mut last = last_cell.get();
+        last_cell.set(Some((time, edges)));
+        // Floating windows have no double-click gestures.
+        if mapped.is_floating() {
+            last = None;
+            last_cell.set(None);
+        }
+        let double = last.and_then(|(last_time, last_edges)| {
+            (time.saturating_sub(last_time) <= DOUBLE_CLICK_TIME).then(|| {
+                // Allow a quick resize after a triple click.
+                last_cell.set(None);
+                last_edges
+            })
+        });
+
+        self.niri.layout.activate_window(&window);
+
+        if let Some(last_edges) = double {
+            {
+                let intersection = edges.intersection(last_edges);
+                if intersection.intersects(ResizeEdge::LEFT_RIGHT) {
+                    self.niri.layout.toggle_full_width();
+                }
+                if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
+                    self.niri.layout.reset_window_height(Some(&window));
+                }
+                // FIXME: granular.
+                self.niri.queue_redraw_all();
+                return;
+            }
+        }
+
+        if self
+            .niri
+            .layout
+            .interactive_resize_begin(window.clone(), edges)
+        {
+            let start_data = PointerGrabStartData {
+                focus: None,
+                button: button_code,
+                location,
+            };
+            let grab = ResizeGrab::new(start_data, window);
+            pointer.set_grab(self, grab, serial, Focus::Clear);
+            self.niri
+                .cursor_manager
+                .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
+        }
+        // FIXME: granular.
+        self.niri.queue_redraw_all();
+    }
+
+    /// Spawns `titlebar.menu-command` for `window`'s menu: its id, the output under the pointer,
+    /// the pointer's logical position on it and the window's state appended.
+    fn spawn_titlebar_menu(&mut self, window: &smithay::desktop::Window) {
+        let mut command = self
+            .niri
+            .config
+            .borrow()
+            .layout
+            .titlebar
+            .menu_command
+            .clone();
+        if command.is_empty() {
+            return;
+        }
+        let Some((id, state, floating)) = self
+            .niri
+            .layout
+            .windows()
+            .find(|(_, m)| m.window == *window)
+            .map(|(_, m)| {
+                let mode = m.sizing_mode();
+                let state: Vec<&str> = [
+                    (m.is_floating(), "floating"),
+                    (mode.is_maximized(), "maximized"),
+                    (mode.is_fullscreen(), "fullscreen"),
+                ]
+                .into_iter()
+                .filter_map(|(on, name)| on.then_some(name))
+                .collect();
+                (m.id().get(), state.join(","), m.is_floating())
+            })
+        else {
+            return;
+        };
+        let location = self.niri.seat.get_pointer().unwrap().current_location();
+        let Some((output, mut pos)) = self.niri.output_under(location) else {
+            return;
+        };
+        // Clicking the bar activates the window, which may scroll the view to it: put the menu
+        // where the button will be once the view gets there.
+        if !floating {
+            if let Some(mon) = self.niri.layout.monitor_for_output(&output) {
+                pos.x -= mon.active_workspace_ref().view_travel();
+            }
+        }
+        command.extend([
+            id.to_string(),
+            output.name(),
+            format!("{:.0}", pos.x),
+            format!("{:.0}", pos.y),
+            if state.is_empty() {
+                "-".to_owned()
+            } else {
+                state
+            },
+        ]);
+        let (token, _) = self.niri.activation_state.create_external_token(None);
+        spawn(command, Some(token.clone()));
+    }
+
+    fn titlebar_button_clicked(
+        &mut self,
+        window: &smithay::desktop::Window,
+        part: TitlebarPart,
+        alt: bool,
+    ) {
+        let TitlebarPart::Button(button) = part else {
+            return;
+        };
+        match button {
+            TitlebarButton::Close => {
+                let mapped = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.window == *window);
+                if let Some((_, mapped)) = mapped {
+                    mapped.toplevel().send_close();
+                }
+            }
+            TitlebarButton::Zoom if alt => self.niri.layout.toggle_fullscreen(window),
+            TitlebarButton::Zoom => {
+                let state = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.window == *window)
+                    .map(|(_, m)| (m.is_floating(), m.sizing_mode()));
+                if let Some((floating, mode)) = state {
+                    if mode.is_fullscreen() {
+                        // Any click leaves fullscreen.
+                        self.niri.layout.toggle_fullscreen(window);
+                    } else if mode.is_maximized() {
+                        // Maximized: float it, at its own size.
+                        self.niri.layout.toggle_maximized(window);
+                        self.niri.layout.toggle_window_floating(Some(window));
+                    } else {
+                        // Floating or tiled: maximize it, in the columns.
+                        if floating {
+                            self.niri.layout.toggle_window_floating(Some(window));
+                        }
+                        self.niri.layout.toggle_maximized(window);
+                    }
+                }
+            }
+            TitlebarButton::Float => {
+                self.niri.layout.toggle_window_floating(Some(window));
+            }
+            // Alt-click: fullscreen, like Option-click on the Mac's green button; in fullscreen
+            // (a transparent bar keeps its buttons there) any click leaves it.
+            TitlebarButton::Maximize
+                if alt
+                    || self
+                        .niri
+                        .layout
+                        .windows()
+                        .any(|(_, m)| m.window == *window && m.sizing_mode().is_fullscreen()) =>
+            {
+                self.niri.layout.toggle_fullscreen(window)
+            }
+            TitlebarButton::Maximize => self.niri.layout.toggle_maximized(window),
+            TitlebarButton::MaximizeColumn => {
+                self.niri.layout.activate_window(window);
+                self.niri.layout.toggle_full_width();
+            }
+            TitlebarButton::Fullscreen => self.niri.layout.toggle_fullscreen(window),
+            TitlebarButton::Menu => self.spawn_titlebar_menu(window),
+        }
+        // FIXME: granular.
+        self.niri.queue_redraw_all();
+    }
+
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
         let pointer = self.niri.seat.get_pointer().unwrap();
 
@@ -2751,6 +2977,19 @@ impl State {
             return;
         }
 
+        if button_state == ButtonState::Released && button == Some(MouseButton::Left) {
+            if let Some((window, part, alt)) = self.niri.titlebar_press.take() {
+                let under = self.niri.contents_under(pointer.current_location()).window;
+                let still_over = matches!(
+                    under,
+                    Some((w, HitType::Activate { titlebar: Some(p), .. })) if w == window && p == part
+                );
+                if still_over {
+                    self.titlebar_button_clicked(&window, part, alt);
+                }
+            }
+        }
+
         if ButtonState::Pressed == button_state {
             let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
             let modifiers = modifiers_from_state(mods);
@@ -2762,11 +3001,17 @@ impl State {
                     let location = pointer.current_location();
                     let (output, pos_within_output) = self.niri.output_under(location).unwrap();
                     if mru_output == output {
-                        let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                        if id.is_some() {
-                            self.confirm_mru();
+                        if let Some(scope) = self.niri.window_mru_ui.scope_under(pos_within_output)
+                        {
+                            self.niri.window_mru_ui.set_scope(scope);
+                            self.niri.queue_redraw_mru_output();
                         } else {
-                            self.niri.cancel_mru();
+                            let id = self.niri.window_mru_ui.select_under(pos_within_output);
+                            if id.is_some() {
+                                self.confirm_mru();
+                            } else {
+                                self.niri.cancel_mru();
+                            }
                         }
                     } else {
                         self.niri.cancel_mru();
@@ -2873,13 +3118,66 @@ impl State {
                 }
             }
 
-            if let Some(mapped) = self.niri.window_under_cursor() {
+            // Dragging a window's edge (the gaps around it, its border) resizes it.
+            let edge =
+                (button == Some(MouseButton::Left) && !pointer.is_grabbed() && !is_overview_open)
+                    .then(|| self.niri.edge_resize_under(pointer.current_location()))
+                    .flatten();
+            if let Some((window, edges)) = edge {
+                self.begin_edge_resize(window, edges, button_code, serial);
+            } else if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
 
                 // Check if we need to start an interactive move.
                 if button == Some(MouseButton::Left) && !pointer.is_grabbed() {
                     let mod_down = modifiers_from_state(mods).contains(mod_key.to_modifiers());
-                    if is_overview_open || mod_down {
+                    let titlebar = match self.niri.contents_under(pointer.current_location()).window
+                    {
+                        Some((
+                            w,
+                            HitType::Activate {
+                                titlebar: Some(part),
+                                ..
+                            },
+                        )) if w == window => Some(part),
+                        _ => None,
+                    };
+                    if let (Some(part), false, false) = (titlebar, is_overview_open, mod_down) {
+                        self.niri.layout.activate_window(&window);
+                        if part == TitlebarPart::Bar {
+                            let time = get_monotonic_time();
+                            let double = matches!(
+                                &self.niri.titlebar_last_click,
+                                Some((w, last)) if *w == window
+                                    && time.saturating_sub(*last) <= DOUBLE_CLICK_TIME
+                            );
+                            if double {
+                                // Double-clicking the bar toggles the column's full width,
+                                // as the square button does.
+                                self.niri.titlebar_last_click = None;
+                                self.niri.layout.toggle_full_width();
+                            } else {
+                                self.niri.titlebar_last_click = Some((window.clone(), time));
+
+                                // Drag the title bar like a client-side one asking to move.
+                                let start_data = PointerGrabStartData {
+                                    focus: None,
+                                    button: button_code,
+                                    location: pointer.current_location(),
+                                };
+                                let start_data = PointerOrTouchStartData::Pointer(start_data);
+                                if let Some(grab) =
+                                    MoveGrab::new(self, start_data, window.clone(), true, None)
+                                {
+                                    pointer.set_grab(self, grab, serial, Focus::Clear);
+                                }
+                            }
+                        } else {
+                            // Buttons act on release over the same button.
+                            let alt = modifiers_from_state(mods).contains(Modifiers::ALT);
+                            self.niri.titlebar_press = Some((window.clone(), part, alt));
+                        }
+                    } else if is_overview_open || mod_down {
                         let location = pointer.current_location();
 
                         if !is_overview_open {
@@ -3615,11 +3913,17 @@ impl State {
                     } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
                         if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                             if mru_output == output {
-                                let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                                if id.is_some() {
-                                    self.confirm_mru();
+                                let mru = &mut self.niri.window_mru_ui;
+                                if let Some(scope) = mru.scope_under(pos_within_output) {
+                                    mru.set_scope(scope);
+                                    self.niri.queue_redraw_mru_output();
                                 } else {
-                                    self.niri.cancel_mru();
+                                    let id = mru.pointer_motion(pos_within_output);
+                                    if id.is_some() {
+                                        self.confirm_mru();
+                                    } else {
+                                        self.niri.cancel_mru();
+                                    }
                                 }
                             } else {
                                 self.niri.cancel_mru();
@@ -3940,6 +4244,11 @@ impl State {
     }
 
     fn on_gesture_pinch_begin<I: InputBackend>(&mut self, event: I::GesturePinchBeginEvent) {
+        // While the overview is open, pinching zooms it in and out instead of going to clients.
+        if self.niri.layout.overview_pinch_begin() {
+            return;
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.niri.seat.get_pointer().unwrap();
 
@@ -3958,6 +4267,13 @@ impl State {
     }
 
     fn on_gesture_pinch_update<I: InputBackend>(&mut self, event: I::GesturePinchUpdateEvent) {
+        if let Some(redraw) = self.niri.layout.overview_pinch_update(event.scale()) {
+            if redraw {
+                self.niri.queue_redraw_all();
+            }
+            return;
+        }
+
         let pointer = self.niri.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
@@ -3976,6 +4292,16 @@ impl State {
     }
 
     fn on_gesture_pinch_end<I: InputBackend>(&mut self, event: I::GesturePinchEndEvent) {
+        if self.niri.layout.overview_pinch_end() {
+            // Drive the rubber-band snap-back, if any.
+            self.niri.queue_redraw_all();
+            // The pointer may now be over a different window or workspace.
+            if self.update_pointer_contents() {
+                self.niri.seat.get_pointer().unwrap().frame(self);
+            }
+            return;
+        }
+
         let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.niri.seat.get_pointer().unwrap();
 
@@ -4095,11 +4421,17 @@ impl State {
         } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                 if mru_output == output {
-                    let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                    if id.is_some() {
-                        self.confirm_mru();
+                    let mru = &mut self.niri.window_mru_ui;
+                    if let Some(scope) = mru.scope_under(pos_within_output) {
+                        mru.set_scope(scope);
+                        self.niri.queue_redraw_mru_output();
                     } else {
-                        self.niri.cancel_mru();
+                        let id = mru.pointer_motion(pos_within_output);
+                        if id.is_some() {
+                            self.confirm_mru();
+                        } else {
+                            self.niri.cancel_mru();
+                        }
                     }
                 } else {
                     self.niri.cancel_mru();
@@ -4570,6 +4902,15 @@ fn should_notify_activity<I: InputBackend>(event: &InputEvent<I>) -> bool {
         event,
         InputEvent::DeviceAdded { .. } | InputEvent::DeviceRemoved { .. }
     )
+}
+
+fn is_user_action<I: InputBackend>(event: &InputEvent<I>) -> bool {
+    match event {
+        InputEvent::Keyboard { event } => event.state() == KeyState::Pressed,
+        InputEvent::PointerButton { event } => event.state() == ButtonState::Pressed,
+        InputEvent::TouchDown { .. } | InputEvent::TabletToolTip { .. } => true,
+        _ => false,
+    }
 }
 
 fn should_reset_pointer_inactivity_timer<I: InputBackend>(event: &InputEvent<I>) -> bool {

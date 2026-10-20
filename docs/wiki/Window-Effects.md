@@ -46,6 +46,8 @@ Windows can also blur their pop-up menus using `ext-background-effect`.
 On the niri side, you can do it with a `popups` block inside [`window-rule`](./Configuration:-Window-Rules.md#popups) and [`layer-rule`](./Configuration:-Layer-Rules.md#popups).
 See those wiki pages for examples and limitations.
 
+A layer surface's requested blur fades in and out with the [`blur-fade` animation](./Configuration:-Animations.md#blur-fade) (niri-tuned) when it starts or stops requesting a region.
+
 Global blur settings are configured in the [`blur {}` config section](./Configuration:-Miscellaneous.md#blur) and apply to all background blur.
 
 ### Xray

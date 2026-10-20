@@ -26,6 +26,13 @@ pub struct Cli {
     /// on a TTY as your non-main compositor instance, to avoid messing up the global environment.
     #[arg(long)]
     pub session: bool,
+    /// Start with the session locked, before anything is drawn.
+    ///
+    /// The first ext-session-lock client (the lock screen) takes the lock over; until then the
+    /// screen shows the locked colour and only allow-when-locked binds run. For a display manager
+    /// that logs in automatically: the login is then the lock screen's unlock.
+    #[arg(long)]
+    pub locked: bool,
     /// Command to run upon compositor startup.
     #[arg(last = true)]
     pub command: Vec<OsString>,

@@ -139,6 +139,7 @@ use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::layer::MappedLayer;
 use crate::layout::tile::TileRenderElement;
+use crate::layout::titlebar::TitlebarPart;
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
@@ -153,6 +154,8 @@ use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManag
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
+use crate::render_helpers::framebuffer_effect::FramebufferEffectElement;
+use crate::render_helpers::overview_blur::OverviewBlur;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -172,19 +175,21 @@ use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
-use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
+use crate::utils::spawning::{spawn, CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland,
+    send_scale_transform, write_png_rgba8, xwayland, ResizeEdge,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
-const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
+// Black, not upstream's dark red: it is what shows at an automatic login (`--locked`) before the
+// lock screen's first frame, right after the black boot splash.
+const CLEAR_COLOR_LOCKED: [f32; 4] = [0., 0., 0., 1.];
 
 // We'll try to send frame callbacks at least once a second. We'll make a timer that fires once a
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
@@ -310,6 +315,8 @@ pub struct Niri {
     pub security_context_state: SecurityContextState,
     pub gamma_control_manager_state: GammaControlManagerState,
     pub activation_state: XdgActivationState,
+    /// Where windows that are about to open go (`Request::PlaceWindows`).
+    pub window_placements: Option<crate::window_placement::Placements<Window>>,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
@@ -326,6 +333,18 @@ pub struct Niri {
     pub suppressed_keys: HashSet<Keycode>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
+    /// Title bar button pressed with the left mouse button, and whether Alt was held; it acts
+    /// on release over it.
+    pub titlebar_press: Option<(Window, TitlebarPart, bool)>,
+    /// The view targets when a shell menu (a layer surface named titlebar.menu-namespace)
+    /// appeared, and whether titlebar.menu-close-command already ran for it: once a view
+    /// scrolls, switches workspace or the overview opens or closes, the menu would no longer be
+    /// beside what it belongs to.
+    pub titlebar_menu_view: Option<(Vec<(f64, f64)>, bool)>,
+    /// Last left click on a title bar, for double-click to maximize.
+    pub titlebar_last_click: Option<(Window, Duration)>,
+    /// The window edges under the pointer, whose resize cursor it shows.
+    pub edge_resize_hover: Option<ResizeEdge>,
     pub bind_cooldown_timers: HashMap<Key, RegistrationToken>,
     pub bind_repeat_timer: Option<RegistrationToken>,
     pub keyboard_focus: KeyboardFocus,
@@ -478,6 +497,8 @@ pub struct OutputState {
     /// tracking issues and make screenshots easier.
     pub backdrop_buffer: SolidColorBuffer,
     pub xray: Xray,
+    /// The overview's backdrop blur.
+    pub overview_blur: OverviewBlur,
     pub lock_render_state: LockRenderState,
     pub lock_surface: Option<LockSurface>,
     pub lock_color_buffer: SolidColorBuffer,
@@ -549,6 +570,10 @@ pub enum LockState {
     },
     Locking(SessionLocker),
     Locked(ExtSessionLockV1),
+    /// Started locked (`niri --locked`) and no lock client has taken the lock yet. Treated like
+    /// a lock whose client died: the screen shows the locked colour, only allow-when-locked binds
+    /// run, and the first ext-session-lock client takes the lock over at once.
+    Held,
 }
 
 #[derive(PartialEq, Eq)]
@@ -778,6 +803,45 @@ impl State {
         self.niri.notified_activity_this_iteration = false;
     }
 
+    /// Closes an open shell menu (titlebar.menu-close-command) once a view moves away from
+    /// where it was when the menu appeared.
+    fn refresh_titlebar_menu(&mut self) {
+        let (namespace, command) = {
+            let config = self.niri.config.borrow();
+            let titlebar = &config.layout.titlebar;
+            (
+                titlebar.menu_namespace.clone(),
+                titlebar.menu_close_command.clone(),
+            )
+        };
+        let open = !namespace.is_empty()
+            && !command.is_empty()
+            && self.niri.layout.outputs().any(|output| {
+                layer_map_for_output(output)
+                    .layers()
+                    .any(|layer| layer.namespace() == namespace)
+            });
+        if !open {
+            self.niri.titlebar_menu_view = None;
+            return;
+        }
+        let now = self.niri.layout.view_targets();
+        let Some((opened, closing)) = &self.niri.titlebar_menu_view else {
+            self.niri.titlebar_menu_view = Some((now, false));
+            return;
+        };
+        let moved = now.len() != opened.len()
+            || now
+                .iter()
+                .zip(opened)
+                .any(|(a, b)| (a.0 - b.0).abs() > 1e-3 || (a.1 - b.1).abs() > 0.5);
+        if !moved || *closing {
+            return;
+        }
+        self.niri.titlebar_menu_view = Some((now, true));
+        spawn(command, None);
+    }
+
     // We monitor both libinput and logind: libinput is always there (including without DBus), but
     // it misses some switch events (e.g. after unsuspend) on some systems.
     pub fn set_lid_closed(&mut self, is_closed: bool) {
@@ -808,6 +872,7 @@ impl State {
 
         // Needs to be called after updating the keyboard focus.
         self.niri.refresh_layout();
+        self.refresh_titlebar_menu();
 
         self.niri.cursor_manager.check_cursor_image_surface_alive();
         self.niri.refresh_pointer_outputs();
@@ -828,6 +893,7 @@ impl State {
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
         self.ipc_refresh_layout();
+        self.ipc_refresh_views();
         self.ipc_refresh_keyboard_layout_index();
 
         // Needs to be called after updating the keyboard focus.
@@ -861,6 +927,7 @@ impl State {
         }
 
         self.niri.pointer_contents.clone_from(&under);
+        self.niri.update_titlebar_hover();
 
         let pointer = &self.niri.seat.get_pointer().unwrap();
         pointer.motion(
@@ -872,6 +939,7 @@ impl State {
                 time: get_monotonic_time().as_millis() as u32,
             },
         );
+        self.niri.update_edge_resize_cursor(location);
         pointer.frame(self);
 
         self.niri.maybe_activate_pointer_constraint();
@@ -1081,6 +1149,7 @@ impl State {
         }
 
         self.niri.pointer_contents.clone_from(&under);
+        self.niri.update_titlebar_hover();
 
         pointer.motion(
             self,
@@ -1091,6 +1160,7 @@ impl State {
                 time: get_monotonic_time().as_millis() as u32,
             },
         );
+        self.niri.update_edge_resize_cursor(location);
 
         self.niri.maybe_activate_pointer_constraint();
 
@@ -1675,7 +1745,7 @@ impl State {
             self.niri.reset_pointer_inactivity_timer();
         }
 
-        if binds_changed {
+        if binds_changed || recent_windows_changed {
             self.niri.window_mru_ui.update_binds();
         }
 
@@ -1955,7 +2025,9 @@ impl State {
         self.niri.output_management_state.notify_changes(new_config);
     }
 
-    pub fn open_screenshot_ui(&mut self, show_pointer: bool, path: Option<String>) {
+    pub fn open_screenshot_ui(&mut self, show_pointer: Option<bool>, path: Option<String>) {
+        let show_pointer =
+            show_pointer.unwrap_or(self.niri.config.borrow().screenshot_ui.show_pointer);
         if self.niri.is_locked() || self.niri.screenshot_ui.is_open() {
             return;
         }
@@ -2016,6 +2088,9 @@ impl State {
     }
 
     pub fn confirm_screenshot(&mut self, write_to_disk: bool) {
+        if !self.niri.screenshot_ui.has_selection() {
+            return;
+        }
         let ScreenshotUi::Open { path, .. } = &mut self.niri.screenshot_ui else {
             return;
         };
@@ -2552,12 +2627,17 @@ impl Niri {
             popup_grab: None,
             suppressed_keys: HashSet::new(),
             suppressed_buttons: HashSet::new(),
+            titlebar_press: None,
+            titlebar_menu_view: None,
+            titlebar_last_click: None,
+            edge_resize_hover: None,
             bind_cooldown_timers: HashMap::new(),
             bind_repeat_timer: Option::default(),
             presentation_state,
             security_context_state,
             gamma_control_manager_state,
             activation_state,
+            window_placements: None,
             mutter_x11_interop_state,
             #[cfg(test)]
             single_pixel_buffer_state,
@@ -2870,6 +2950,7 @@ impl Niri {
             frame_callback_sequence: 0,
             backdrop_buffer: SolidColorBuffer::new(size, backdrop_color),
             xray: Xray::new(),
+            overview_blur: OverviewBlur::new(),
             lock_render_state,
             lock_surface: None,
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
@@ -4290,6 +4371,9 @@ impl Niri {
         // workspaces, since the interactively-moved window already has a focus ring.
         let focus_ring = !self.layout.interactive_move_is_moving_above_output(output);
 
+        // The Flip 3D switcher draws this output's windows itself, in the stack.
+        let hide_windows = self.window_mru_ui.hides_windows(output);
+
         // Get monitor elements.
         let mon = self.layout.monitor_for_output(output).unwrap();
         let zoom = mon.overview_zoom();
@@ -4359,12 +4443,18 @@ impl Niri {
         // When rendering above the top layer, we put the regular monitor elements first.
         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
         if mon.render_above_top_layer() {
-            self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+            if !hide_windows {
+                self.layout
+                    .render_interactive_move_for_output(ctx.r(), output, &mut |elem| {
+                        push(elem.into())
+                    });
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+                mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| {
+                    push(elem.into())
+                });
 
-            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+                mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+            }
 
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
@@ -4382,10 +4472,16 @@ impl Niri {
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
 
-            self.layout
-                .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
+            if !hide_windows {
+                self.layout
+                    .render_interactive_move_for_output(ctx.r(), output, &mut |elem| {
+                        push(elem.into())
+                    });
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+                mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| {
+                    push(elem.into())
+                });
+            }
 
             // Macro instead of closure to avoid borrowing push().
             macro_rules! process {
@@ -4405,7 +4501,9 @@ impl Niri {
                 push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
             }
 
-            mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+            if !hide_windows {
+                mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
+            }
 
             for (ws, geo) in mon.workspaces_with_render_geo() {
                 // The render element namespace. This will be set to the workspace index for
@@ -4425,7 +4523,19 @@ impl Niri {
             }
         }
 
+        mon.render_workspace_highlights(ctx.renderer, &mut |elem| push(elem.into()));
         mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
+
+        // The backdrop's blur, growing as the overview opens (over the backdrop only).
+        let output_geo = Rectangle::from_size(output_size(output));
+        if let Some(elem) = state.overview_blur.render(
+            &self.config.borrow().overview.backdrop_blur,
+            mon.overview_progress_clamped(),
+            output_geo,
+            output_scale.x,
+        ) {
+            push(elem.into());
+        }
 
         // Then the backdrop.
         push_popups_from_layer!(Layer::Background, true);
@@ -5731,10 +5841,8 @@ impl Niri {
                 debug!("not saving screenshot to disk");
             }
 
-            #[cfg(feature = "dbus")]
-            if let Err(err) = crate::utils::show_screenshot_notification(image_path.as_deref()) {
-                warn!("error showing screenshot notification: {err:?}");
-            }
+            // No desktop notification here: the session (ALNIAC) listens for the
+            // ScreenshotCaptured event below and sends its own confirmation.
 
             // Send screenshot completion event.
             let path_string = image_path
@@ -5823,7 +5931,7 @@ impl Niri {
     pub fn is_locked(&self) -> bool {
         match self.lock_state {
             LockState::Unlocked | LockState::WaitingForSurfaces { .. } => false,
-            LockState::Locking(_) | LockState::Locked(_) => true,
+            LockState::Locking(_) | LockState::Locked(_) | LockState::Held => true,
         }
     }
 
@@ -5834,6 +5942,15 @@ impl Niri {
             LockState::WaitingForSurfaces { .. } | LockState::Locking(_)
         ) {
             info!("refusing lock as another client is currently locking");
+            return;
+        }
+
+        // Started locked: nothing was ever shown unlocked, so take the lock at once.
+        if matches!(self.lock_state, LockState::Held) {
+            info!("locking session (taking over the startup lock)");
+            let lock = confirmation.ext_session_lock().clone();
+            confirmation.lock();
+            self.lock_state = LockState::Locked(lock);
             return;
         }
 
@@ -6013,7 +6130,7 @@ impl Niri {
         // Consider only the fully locked state here. When using the locked hint with sleep
         // inhibitor tools, we want to allow sleep only after the screens are fully cleared with
         // the lock screen, which corresponds to the Locked state.
-        let locked = matches!(self.lock_state, LockState::Locked(_));
+        let locked = matches!(self.lock_state, LockState::Locked(_) | LockState::Held);
 
         if self.locked_hint.is_some_and(|h| h == locked) {
             return;
@@ -6040,6 +6157,10 @@ impl Niri {
         let lock = match &self.lock_state {
             LockState::Unlocked => {
                 error!("tried to add a lock surface on an unlocked session");
+                return;
+            }
+            LockState::Held => {
+                debug!("ignoring lock surface before its client took the startup lock");
                 return;
             }
             LockState::WaitingForSurfaces { confirmation, .. } => confirmation.ext_session_lock(),
@@ -6172,6 +6293,82 @@ impl Niri {
         }
     }
 
+    /// Whether the pointer is over the desktop around windows: no window's surface, no layer
+    /// surface above the windows (the wallpaper and bottom layers are below them).
+    fn pointer_over_desktop(&self) -> bool {
+        if matches!(
+            self.pointer_contents.window,
+            Some((_, HitType::Input { .. }))
+        ) {
+            return false;
+        }
+        match &self.pointer_contents.layer {
+            Some(layer) => matches!(layer.layer(), Layer::Background | Layer::Bottom),
+            None => self.pointer_contents.surface.is_none(),
+        }
+    }
+
+    /// The window edge at `location`, for resizing by dragging it: only over the desktop around
+    /// windows (the gaps, their borders), with nothing grabbed and no overview or other UI open.
+    pub fn edge_resize_under(&self, location: Point<f64, Logical>) -> Option<(Window, ResizeEdge)> {
+        if !self.pointer_over_desktop()
+            || self.layout.is_overview_open()
+            || self.screenshot_ui.is_open()
+            || self.window_mru_ui.is_open()
+            || self.is_locked()
+        {
+            return None;
+        }
+        if self.seat.get_pointer()?.is_grabbed() {
+            return None;
+        }
+        let (output, pos_within_output) = self.output_under(location)?;
+        let (mapped, edges) = self.layout.edge_resize_under(output, pos_within_output)?;
+        Some((mapped.window.clone(), edges))
+    }
+
+    /// Shows the resize cursor over a window edge, and the default one again after it.
+    pub fn update_edge_resize_cursor(&mut self, location: Point<f64, Logical>) {
+        let edges = self.edge_resize_under(location).map(|(_, edges)| edges);
+        if edges == self.edge_resize_hover {
+            return;
+        }
+        match edges {
+            Some(edges) => self
+                .cursor_manager
+                .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon())),
+            // Back over the desktop. Entering a window instead, it sets its own cursor.
+            None if self.pointer_over_desktop() => self
+                .cursor_manager
+                .set_cursor_image(CursorImageStatus::default_named()),
+            None => (),
+        }
+        self.edge_resize_hover = edges;
+        // FIXME: granular.
+        self.queue_redraw_all();
+    }
+
+    /// Highlights the title bar button under the pointer.
+    pub fn update_titlebar_hover(&mut self) {
+        let hover = match &self.pointer_contents.window {
+            Some((
+                window,
+                HitType::Activate {
+                    titlebar: Some(part),
+                    ..
+                },
+            )) => Some((window.clone(), *part)),
+            _ => None,
+        };
+        if self
+            .layout
+            .set_titlebar_hover(hover.as_ref().map(|(window, part)| (window, *part)))
+        {
+            // FIXME: granular.
+            self.queue_redraw_all();
+        }
+    }
+
     pub fn handle_focus_follows_mouse(&mut self, new_focus: &PointContents) {
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {
             return;
@@ -6203,7 +6400,8 @@ impl Niri {
                 if matches!(
                     hit,
                     HitType::Activate {
-                        is_tab_indicator: true
+                        is_tab_indicator: true,
+                        ..
                     }
                 ) {
                     return;
@@ -6524,6 +6722,7 @@ niri_render_elements! {
         WindowMruUi = WindowMruUiRenderElement<R>,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
+        OverviewBlur = FramebufferEffectElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
     }

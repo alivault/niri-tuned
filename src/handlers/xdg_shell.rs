@@ -431,8 +431,12 @@ impl XdgShellHandler for State {
                     rules,
                     output,
                     is_pending_maximized,
+                    maximized_by_layout,
                     ..
                 } => {
+                    // The window asked for it itself.
+                    *maximized_by_layout = false;
+
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
                     let mon = output
@@ -519,7 +523,11 @@ impl XdgShellHandler for State {
                     output,
                     workspace_name,
                     is_pending_maximized,
+                    maximized_by_layout,
                 } => {
+                    // The window asked to be unmaximized itself.
+                    *maximized_by_layout = false;
+
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
                     let mon = workspace_name
@@ -730,6 +738,7 @@ impl XdgShellHandler for State {
                     output,
                     workspace_name,
                     is_pending_maximized,
+                    maximized_by_layout: _,
                 } => {
                     // Figure out the monitor following a similar logic to initial configure.
                     // FIXME: deduplicate.
@@ -1027,17 +1036,23 @@ impl State {
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
 
+        // A window that is about to take a restore placement opens at its saved size and state.
+        let placement = crate::window_placement::peek(self, toplevel);
+
         let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
         };
 
         let config = self.niri.config.borrow();
-        let rules = ResolvedWindowRules::compute(
+        let mut rules = ResolvedWindowRules::compute(
             &config.window_rules,
             WindowRef::Unmapped(unmapped),
             self.niri.is_at_startup,
         );
+        if let Some(placement) = &placement {
+            crate::window_placement::apply_to_initial_rules(placement, &mut rules);
+        }
 
         let Unmapped { window, state, .. } = unmapped;
 
@@ -1122,10 +1137,20 @@ impl State {
             });
 
         let mut is_pending_maximized = false;
+        let mut maximized_by_layout = false;
         if let Some(ws) = ws {
             // Set a fullscreen and maximized state based on window request and window rule.
             is_pending_maximized = (*wants_maximized && rules.open_maximized_to_edges.is_none())
                 || rules.open_maximized_to_edges == Some(true);
+
+            // Otherwise the layout's open-maximized-to-edges, for windows that don't float.
+            if !is_pending_maximized
+                && rules.open_maximized_to_edges.is_none()
+                && ws.opens_maximized_by_default(is_floating)
+            {
+                is_pending_maximized = true;
+                maximized_by_layout = true;
+            }
 
             if (wants_fullscreen.is_some() && rules.open_fullscreen.is_none())
                 || rules.open_fullscreen == Some(true)
@@ -1175,6 +1200,7 @@ impl State {
             output,
             workspace_name: ws.and_then(|w| w.name().cloned()),
             is_pending_maximized,
+            maximized_by_layout,
         };
 
         trace!(surface = %toplevel.wl_surface().id(), "sending initial configure");

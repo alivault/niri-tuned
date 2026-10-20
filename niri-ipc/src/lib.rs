@@ -65,6 +65,13 @@ pub mod state;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Request {
+    /// Output-wide SDR CTM nightlight. None queries capabilities/applied state.
+    /// A write leases control to this IPC connection until disable/disconnect.
+    /// This is distinct from gamma-LUT control and does not emulate arbitrary LUTs.
+    Nightlight {
+        /// True selects 4000 K, false restores captured calibration exactly.
+        enabled: Option<bool>,
+    },
     /// Request the version string for the running niri instance.
     Version,
     /// Request information about connected outputs.
@@ -119,6 +126,66 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Start continuously receiving where each output's view is, for a bar that follows
+    /// workspace and column switches as they happen (swipes and animations included).
+    ///
+    /// The compositor should reply with `Reply::Ok(Response::Handled)`, then send the current
+    /// [`OutputView`]s as a JSON array, one array per line, again whenever any of them changes
+    /// (at most once per frame while a view moves). Lines are never queued up: a client that
+    /// reads slowly gets the newest state, never a backlog.
+    ViewStream,
+    /// Place windows that are about to open, such as ones reopened at login.
+    ///
+    /// Each placement is matched to one new toplevel. A matched window opens directly where the
+    /// placement says, at its saved size, without taking focus (unless `focus` is set and the
+    /// user has not pressed a key or button since this request). Placements expire after
+    /// `timeout_ms`; a new request replaces the previous one, and an empty one clears it.
+    PlaceWindows(WindowPlacements),
+}
+
+/// Placements for windows that are about to open; see [`Request::PlaceWindows`].
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowPlacements {
+    /// The placements, in the order windows should prefer them.
+    pub placements: Vec<WindowPlacement>,
+    /// How long the placements wait for their windows, in milliseconds.
+    pub timeout_ms: u32,
+}
+
+/// Where one window that is about to open goes.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowPlacement {
+    /// Value of `NIRI_PLACEMENT_TOKEN` in the environment of the process that opens the window.
+    ///
+    /// A window whose process carries a different token never matches this placement. A window
+    /// whose process carries no token matches by `app_id` only (for apps started through
+    /// D-Bus activation and the like).
+    pub token: Option<String>,
+    /// App ID the window must have.
+    pub app_id: Option<String>,
+    /// Title the window is preferred to have; windows sharing a token pick by it.
+    pub title: Option<String>,
+    /// Output to open on (name, or make/model/serial).
+    pub output: Option<String>,
+    /// Workspace to open on.
+    ///
+    /// An index refers to the saved layout, not the current one: windows saved on the same index
+    /// open on one workspace, kept in the saved order relative to the other restored ones.
+    pub workspace: Option<WorkspaceReferenceArg>,
+    /// Saved 1-based column; restored windows keep their relative column order.
+    pub column: Option<u32>,
+    /// Saved 1-based position in the column; windows saved in the same column share one.
+    pub tile: Option<u32>,
+    /// Open floating.
+    pub floating: bool,
+    /// Width in logical pixels.
+    pub width: Option<i32>,
+    /// Open maximized to the edges.
+    pub maximized: bool,
+    /// Focus this window when it opens, unless the user has done something since.
+    pub focus: bool,
 }
 
 /// Reply from niri to client.
@@ -135,6 +202,8 @@ pub type Reply = Result<Response, String>;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Response {
+    /// CTM capability and verified per-output application state.
+    Nightlight(NightlightStatus),
     /// A request that does not need a response was handled successfully.
     Handled,
     /// The version string for the running niri instance.
@@ -165,6 +234,76 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+}
+
+/// Versioned private output-CTM backend capability and applied state.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct NightlightStatus {
+    /// Always "drm-ctm-v1"; not a gamma-LUT capability.
+    pub backend: String,
+    /// Every active output supports readable/writable CTM calibration.
+    pub supported: bool,
+    /// Some(true): every output verified warm. Some(false): ALL outputs verified
+    /// restored. None: mixed, inactive or uncertain; never interpret as off.
+    pub enabled: Option<bool>,
+    /// Current leased intent, including while outputs/session are inactive.
+    pub desired: bool,
+    /// True when this is a native DRM session and its seat is active.
+    pub session_active: bool,
+    /// Advances on output reconciliation/resume, not on state polling.
+    pub generation: u64,
+    /// At least one output still needs restoration (may be a valid warm lease).
+    pub cleanup_pending: bool,
+    /// 4000 when applied, otherwise None; neutral is original calibration.
+    pub temperature: Option<u32>,
+    /// Per-output diagnostics (including partial application/revocation).
+    pub outputs: Vec<NightlightOutput>,
+    /// Empty only when current capability/state checks succeeded.
+    pub error: String,
+}
+
+/// Nightlight status for one active hardware output.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct NightlightOutput {
+    /// Connector/output name.
+    pub name: String,
+    /// A CTM property and valid readable calibration were found.
+    pub supported: bool,
+    /// Warm matrix has been verified against the current KMS property.
+    /// Some(false) means verified original calibration; None means unverified.
+    pub enabled: Option<bool>,
+    /// Restoration is still owed, independently of lease/confirmed enable.
+    pub cleanup_pending: bool,
+    /// Captured sign-magnitude S31.32 matrix; None means original zero blob.
+    pub calibration: Option<[u64; 9]>,
+    /// Failure reason, if any.
+    pub error: String,
+}
+
+/// Where an output's view is; see [`Request::ViewStream`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct OutputView {
+    /// Output name.
+    pub output: String,
+    /// The workspace shown, fractional between two during a switch: the index of
+    /// [`Workspace::idx`] (1-based), e.g. 1.25 is a quarter of the way from the first to the
+    /// second workspace.
+    pub workspace: f64,
+    /// Whether a workspace switch (gesture or animation) is in progress.
+    pub switching: bool,
+    /// Id of the output's active workspace, the one [`OutputView::column`] is about.
+    pub workspace_id: Option<u64>,
+    /// The active workspace's column in view, fractional while the view scrolls between
+    /// columns: 1-based as [`WindowLayout::pos_in_scrolling_layout`]. `None` without columns.
+    ///
+    /// During a gesture it follows the view across the columns; during an animation it moves
+    /// from where it was to the active column with the animation's progress.
+    pub column: Option<f64>,
+    /// Whether the view is scrolling between columns (gesture or animation).
+    pub scrolling: bool,
 }
 
 /// Overview information.
@@ -222,9 +361,10 @@ pub enum Action {
     },
     /// Open the screenshot UI.
     Screenshot {
-        ///  Whether to show the mouse pointer by default in the screenshot UI.
-        #[cfg_attr(feature = "clap", arg(short = 'p', long, action = clap::ArgAction::Set, default_value_t = true))]
-        show_pointer: bool,
+        /// Whether to show the mouse pointer. If omitted, uses screenshot-ui show-pointer.
+        #[cfg_attr(feature = "clap", arg(short = 'p', long, action = clap::ArgAction::Set))]
+        #[serde(default)]
+        show_pointer: Option<bool>,
 
         /// Path to save the screenshot to.
         ///
@@ -2074,6 +2214,20 @@ mod tests {
 
         assert!("-".parse::<SizeChange>().is_err());
         assert!("10% ".parse::<SizeChange>().is_err());
+    }
+
+    #[test]
+    fn screenshot_pointer_preference_is_optional_and_accepts_old_clients() {
+        for (json, expected) in [
+            (r#"{"Screenshot":{}}"#, None),
+            (r#"{"Screenshot":{"show_pointer":true}}"#, Some(true)),
+            (r#"{"Screenshot":{"show_pointer":false}}"#, Some(false)),
+        ] {
+            let action: Action = serde_json::from_str(json).unwrap();
+            assert!(
+                matches!(action, Action::Screenshot { show_pointer, path: None } if show_pointer == expected)
+            );
+        }
     }
 
     #[test]

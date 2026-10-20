@@ -56,7 +56,10 @@ pub use crate::layout::*;
 pub use crate::misc::*;
 pub use crate::output::{Output, OutputName, Outputs, Position, Vrr};
 use crate::recent_windows::RecentWindowsPart;
-pub use crate::recent_windows::{MruDirection, MruFilter, MruPreviews, MruScope, RecentWindows};
+pub use crate::recent_windows::{
+    MruDirection, MruFilter, MruFlip, MruLabel, MruLabelShow, MruLabelText, MruPreviews, MruScope,
+    MruScopePanel, RecentWindows,
+};
 pub use crate::utils::FloatOrInt;
 use crate::utils::{Flag, MergeWith as _};
 pub use crate::window_rule::{
@@ -76,6 +79,7 @@ pub struct Config {
     pub prefer_no_csd: bool,
     pub cursor: Cursor,
     pub screenshot_path: ScreenshotPath,
+    pub screenshot_ui: ScreenshotUi,
     pub clipboard: Clipboard,
     pub hotkey_overlay: HotkeyOverlay,
     pub config_notification: ConfigNotification,
@@ -193,6 +197,7 @@ where
             match name {
                 "input" => m_merge!(input),
                 "cursor" => m_merge!(cursor),
+                "screenshot-ui" => m_merge!(screenshot_ui),
                 "clipboard" => m_merge!(clipboard),
                 "hotkey-overlay" => m_merge!(hotkey_overlay),
                 "config-notification" => m_merge!(config_notification),
@@ -211,7 +216,37 @@ where
                 }
                 "spawn-at-startup" => m_push!(spawn_at_startup),
                 "spawn-sh-at-startup" => m_push!(spawn_sh_at_startup),
-                "window-rule" => m_push!(window_rules),
+                "window-rule" => {
+                    let mut part: WindowRule = knuffel::Decode::decode_node(node, ctx)?;
+                    let mut config = config.borrow_mut();
+                    let rules = &mut config.window_rules;
+                    let name = part.name.clone();
+                    let last = name.as_deref().and_then(|name| {
+                        rules.iter().rposition(|r| r.name.as_deref() == Some(name))
+                    });
+                    match last {
+                        // `off` switches every earlier rule of the name off.
+                        Some(_) if part.off => {
+                            for rule in rules.iter_mut().filter(|r| r.name == name) {
+                                rule.off = true;
+                            }
+                        }
+                        // A change to a named rule goes right after it, for its windows
+                        // unless it says otherwise: rules apply in order, so it changes
+                        // what that rule set (setting by setting, inside blocks too)
+                        // and keeps its place among the other rules.
+                        Some(i) => {
+                            let first = rules.iter().position(|r| r.name == name).unwrap_or(i);
+                            if part.matches.is_empty() && part.excludes.is_empty() {
+                                part.matches = rules[first].matches.clone();
+                                part.excludes = rules[first].excludes.clone();
+                            }
+                            part.off = rules[first].off;
+                            rules.insert(i + 1, part);
+                        }
+                        None => rules.push(part),
+                    }
+                }
                 "layer-rule" => m_push!(layer_rules),
                 "workspace" => m_push!(workspaces),
 
@@ -226,8 +261,8 @@ where
                     let binds = &mut config.binds.0;
                     // Remove existing binds matching any new bind.
                     binds.retain(|bind| !part.0.iter().any(|new| new.key == bind.key));
-                    // Add all new binds.
-                    binds.extend(part.0);
+                    // Add all new binds; an `unbind` only removes.
+                    binds.extend(part.0.into_iter().filter(|b| b.action != Action::Unbind));
                 }
                 "environment" => {
                     let part = Environment::decode_node(node, ctx)?;
@@ -641,6 +676,218 @@ mod tests {
         let _ = Config::load_default();
     }
 
+    /// Parse `main` with `defaults` included first, as a desktop's shipped defaults under a
+    /// user's own config.
+    #[track_caller]
+    fn parse_layered(defaults: &str, main: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!(
+            "niri-layered-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("defaults.kdl"), defaults).unwrap();
+        let text = format!("include \"defaults.kdl\"\n{main}");
+        let path = dir.join("config.kdl");
+        fs::write(&path, &text).unwrap();
+        let config = Config::parse(&path, &text)
+            .config
+            .map_err(miette::Report::new)
+            .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        config
+    }
+
+    #[test]
+    fn layered_overview_blur_and_highlight_merge_setting_by_setting() {
+        // A desktop's defaults turn them on; the user's config changes one setting or turns
+        // one off again.
+        let config = parse_layered(
+            r##"overview {
+                backdrop-blur { on; radius 40; }
+                workspace-highlight { on; fill-color "#112233"; fill-opacity 0.07; }
+            }"##,
+            "overview { backdrop-blur { radius 20; }; workspace-highlight { off; }; }",
+        );
+        assert!(!config.overview.backdrop_blur.off);
+        assert_eq!(config.overview.backdrop_blur.radius, 20.);
+        assert!(config.overview.workspace_highlight.off);
+        assert_eq!(
+            config.overview.workspace_highlight.fill_color,
+            Color::from_rgba8_unpremul(0x11, 0x22, 0x33, 0xff)
+        );
+
+        // A theme's colours and opacities under, the user's opacity alone over them: the
+        // colour stays the theme's (a theme switch still changes it).
+        let config = parse_layered(
+            r##"overview {
+                workspace-highlight {
+                    fill-color "#c1c497"
+                    fill-opacity 0.07
+                    active-border-color "#509475"
+                    active-border-opacity 0.8
+                }
+            }"##,
+            "overview { workspace-highlight { fill-opacity 0.25; active-border-color \"#ff0000\"; }; }",
+        );
+        let h = config.overview.workspace_highlight;
+        let fill = h.fill();
+        assert_eq!(
+            (fill.r, fill.g, fill.b, fill.a),
+            (
+                0xc1 as f32 / 255.,
+                0xc4 as f32 / 255.,
+                0x97 as f32 / 255.,
+                0.25
+            )
+        );
+        assert_eq!(
+            h.active_border_color,
+            Color::from_rgba8_unpremul(0xff, 0, 0, 0xff)
+        );
+        assert_eq!(h.active_border_opacity, 0.8, "the theme's opacity kept");
+
+        let config = parse_layered(
+            "overview { workspace-shadow { off; }; }",
+            "overview { workspace-shadow { on; }; }",
+        );
+        assert!(!config.overview.workspace_shadow.off);
+    }
+
+    #[test]
+    fn layered_touchpad_merges_setting_by_setting() {
+        let config = parse_layered(
+            "input { touchpad { tap; natural-scroll; accel-speed 0.3; click-method \"clickfinger\"; }; }",
+            "input { touchpad { tap false; dwt; }; }",
+        );
+        let t = &config.input.touchpad;
+        assert!(!t.tap, "switched off by the later part");
+        assert!(t.natural_scroll, "kept from the defaults");
+        assert!(t.dwt, "added by the later part");
+        assert_eq!(t.accel_speed.0, 0.3);
+        assert!(t.click_method.is_some());
+
+        let config = parse_layered(
+            "input { mouse { natural-scroll; accel-speed -0.5; }; }",
+            "input { mouse { accel-speed 0.1; }; }",
+        );
+        assert!(config.input.mouse.natural_scroll);
+        assert_eq!(config.input.mouse.accel_speed.0, 0.1);
+    }
+
+    #[test]
+    fn layered_unbind_frees_a_default_key() {
+        let config = parse_layered(
+            "binds { Mod+T { spawn \"alacritty\"; }; Mod+Q { close-window; }; }",
+            "binds { Mod+T { unbind; }; Mod+W { unbind; }; }",
+        );
+        let keys: Vec<String> = config
+            .binds
+            .0
+            .iter()
+            .map(|b| format!("{:?}", b.action))
+            .collect();
+        assert_eq!(config.binds.0.len(), 1, "only Mod+Q is left: {keys:?}");
+        assert_eq!(config.binds.0[0].action, Action::CloseWindow);
+        assert!(config.binds.0.iter().all(|b| b.action != Action::Unbind));
+    }
+
+    #[test]
+    fn layered_named_window_rules() {
+        let config = parse_layered(
+            r#"
+            window-rule "calculator" {
+                match app-id="^calculator$"
+                open-floating true
+                opacity 0.9
+            }
+            window-rule "dialogs" {
+                match app-id="^dialog$"
+                open-floating true
+            }
+            window-rule {
+                match app-id="^calculator$"
+                opacity 0.5
+            }
+            "#,
+            r#"
+            window-rule "calculator" {
+                open-floating false
+            }
+            window-rule "dialogs" { off; }
+            window-rule "mine" {
+                match app-id="^mine$"
+                open-maximized true
+            }
+            "#,
+        );
+        let rules = &config.window_rules;
+        assert_eq!(rules.len(), 5);
+        let (calc, change) = (&rules[0], &rules[1]);
+        assert_eq!(
+            calc.open_floating,
+            Some(true),
+            "the default stays as written"
+        );
+        assert_eq!(change.name.as_deref(), Some("calculator"));
+        assert_eq!(
+            change.open_floating,
+            Some(false),
+            "the change comes right after it"
+        );
+        assert_eq!(change.matches, calc.matches, "for the same windows");
+        assert!(rules[2].off, "the default dialogs rule is switched off");
+        assert_eq!(
+            rules[3].opacity,
+            Some(0.5),
+            "the later unnamed rule still comes after both"
+        );
+        assert_eq!(rules[4].name.as_deref(), Some("mine"));
+
+        // A named rule seen for the first time with no matches is for every window, as ever.
+        let config = do_parse(r#"window-rule "all" { opacity 0.95; }"#);
+        assert!(config.window_rules[0].matches.is_empty());
+        assert!(!config.window_rules[0].off);
+    }
+
+    #[test]
+    fn inactive_shadow_geometry() {
+        let config = do_parse(
+            r#"
+            layout {
+                shadow {
+                    on
+                    softness 30
+                    spread 2
+                    offset x=0 y=8
+                    inactive-softness 12
+                    inactive-offset x=0 y=3
+                }
+            }
+            "#,
+        );
+        let s = config.layout.shadow;
+        let (soft, spread, offset) = s.geometry(true);
+        assert_eq!((soft, spread, offset.y.0), (30., 2., 8.));
+        let (soft, spread, offset) = s.geometry(false);
+        assert_eq!(
+            (soft, spread, offset.y.0),
+            (12., 2., 3.),
+            "unset: the active window's spread"
+        );
+
+        // Included later, a part changes only what it says.
+        let config = parse_layered(
+            "layout { shadow { on; softness 30; inactive-spread 0; }; }",
+            "layout { shadow { inactive-softness 10; }; }",
+        );
+        let (soft, spread, _) = config.layout.shadow.geometry(false);
+        assert_eq!((soft, spread), (10., 0.));
+    }
+
     #[test]
     fn default_repeat_params() {
         let config = Config::parse_mem("").unwrap();
@@ -653,6 +900,34 @@ mod tests {
         Config::parse_mem(text)
             .map_err(miette::Report::new)
             .unwrap()
+    }
+
+    #[test]
+    fn screenshot_ui_preferences() {
+        let defaults = do_parse("").screenshot_ui;
+        assert!(!defaults.remember_selection);
+        assert!(!defaults.show_panel);
+        assert!(!defaults.show_pointer);
+        assert!(defaults.capture_on_release);
+        let mut config = do_parse(
+            r#"
+            screenshot-ui {
+                remember-selection true
+                show-panel true
+                show-pointer true
+                capture-on-release false
+            }
+        "#,
+        );
+        config.screenshot_ui.merge_with(&ScreenshotUiPart {
+            show_panel: Some(false),
+            ..Default::default()
+        });
+        assert!(config.screenshot_ui.remember_selection);
+        assert!(!config.screenshot_ui.show_panel);
+        assert!(config.screenshot_ui.show_pointer);
+        assert!(!config.screenshot_ui.capture_on_release);
+        assert!(Config::parse_mem(r#"screenshot-ui { show-panel "yes"; }"#).is_err());
     }
 
     #[test]
@@ -955,6 +1230,12 @@ mod tests {
 
                 previews {
                     max-height 960
+                }
+
+                scope-panel {
+                    active-color "#509475"
+                    corner-radius 12
+                    font "Inter 14px"
                 }
 
                 binds {
@@ -1360,6 +1641,9 @@ mod tests {
                         a: 0.46666667,
                     },
                     inactive_color: None,
+                    inactive_offset: None,
+                    inactive_softness: None,
+                    inactive_spread: None,
                 },
                 tab_indicator: TabIndicator {
                     off: false,
@@ -1381,6 +1665,98 @@ mod tests {
                     active_gradient: None,
                     inactive_gradient: None,
                     urgent_gradient: None,
+                },
+                titlebar: Titlebar {
+                    off: true,
+                    height: 30.0,
+                    font: "sans Medium 12px",
+                    active_color: Color {
+                        r: 0.17254902,
+                        g: 0.17254902,
+                        b: 0.18039216,
+                        a: 1.0,
+                    },
+                    inactive_color: Color {
+                        r: 0.10980392,
+                        g: 0.10980392,
+                        b: 0.11764706,
+                        a: 1.0,
+                    },
+                    active_text_color: Color {
+                        r: 0.9490196,
+                        g: 0.9490196,
+                        b: 0.96862745,
+                        a: 1.0,
+                    },
+                    inactive_text_color: Color {
+                        r: 0.5568628,
+                        g: 0.5568628,
+                        b: 0.5764706,
+                        a: 1.0,
+                    },
+                    button_color: Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.14901961,
+                    },
+                    button_inactive_color: None,
+                    button_hover_color: None,
+                    button_icon_color: None,
+                    button_icon_inactive_color: None,
+                    button_icon_hover_color: None,
+                    close_hover_color: Color {
+                        r: 1.0,
+                        g: 0.27058825,
+                        b: 0.22745098,
+                        a: 1.0,
+                    },
+                    button_hover_text_color: Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                    button_styles: TitlebarButtonStyles {
+                        close: None,
+                        zoom: None,
+                        float: None,
+                        maximize: None,
+                        maximize_column: None,
+                        fullscreen: None,
+                        menu: None,
+                    },
+                    button_highlight: Always,
+                    close_red: Hover,
+                    button_size: 30.0,
+                    button_circle: 22.0,
+                    icon_size: 15.0,
+                    button_edge_gap: 4.0,
+                    title_gap: 8.0,
+                    button_hover_brighten: 0.14,
+                    buttons_position: Left,
+                    buttons: [
+                        Close,
+                        MaximizeColumn,
+                    ],
+                    menu_command: [],
+                    menu_close_command: [],
+                    menu_namespace: "",
+                    icons: TitlebarIcons {
+                        close: None,
+                        zoom: None,
+                        zoom_active: None,
+                        float: None,
+                        float_active: None,
+                        maximize: None,
+                        maximize_active: None,
+                        maximize_column: None,
+                        fullscreen: None,
+                        fullscreen_active: None,
+                        menu: None,
+                    },
+                    transparent: false,
+                    button_hover_group: false,
                 },
                 insert_hint: InsertHint {
                     off: false,
@@ -1412,6 +1788,12 @@ mod tests {
                             },
                         },
                     ),
+                },
+                edge_resize: EdgeResize {
+                    off: false,
+                    outside: 12.0,
+                    inside: 4.0,
+                    corner: 28.0,
                 },
                 preset_column_widths: [
                     Proportion(
@@ -1449,6 +1831,9 @@ mod tests {
                 center_focused_column: OnOverflow,
                 always_center_single_column: false,
                 empty_workspace_above_first: false,
+                preset_widths_no_wrap: false,
+                preset_heights_no_wrap: false,
+                open_maximized_to_edges: false,
                 default_column_display: Tabbed,
                 gaps: 8.0,
                 struts: Struts {
@@ -1486,6 +1871,12 @@ mod tests {
                     "~/Screenshots/screenshot.png",
                 ),
             ),
+            screenshot_ui: ScreenshotUi {
+                remember_selection: false,
+                show_panel: false,
+                show_pointer: false,
+                capture_on_release: true,
+            },
             clipboard: Clipboard {
                 disable_primary: true,
             },
@@ -1635,6 +2026,17 @@ mod tests {
                         ),
                     },
                 ),
+                blur_fade: BlurFadeAnim(
+                    Animation {
+                        off: false,
+                        kind: Easing(
+                            EasingParams {
+                                duration_ms: 140,
+                                curve: EaseOutCubic,
+                            },
+                        ),
+                    },
+                ),
             },
             blur: Blur {
                 off: false,
@@ -1689,6 +2091,37 @@ mod tests {
                         a: 0.3137255,
                     },
                 },
+                backdrop_blur: OverviewBackdropBlur {
+                    off: true,
+                    radius: 32.0,
+                    noise: 0.02,
+                    saturation: 1.5,
+                },
+                workspace_highlight: WorkspaceHighlight {
+                    off: true,
+                    border_width: 1.0,
+                    fill_color: Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                    fill_opacity: 0.06,
+                    active_border_color: Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                    active_border_opacity: 0.5,
+                    inactive_border_color: Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                    inactive_border_opacity: 0.19,
+                },
             },
             environment: Environment(
                 [
@@ -1710,6 +2143,8 @@ mod tests {
             },
             window_rules: [
                 WindowRule {
+                    name: None,
+                    off: false,
                     matches: [
                         Match {
                             app_id: Some(
@@ -1833,6 +2268,9 @@ mod tests {
                         draw_behind_window: None,
                         color: None,
                         inactive_color: None,
+                        inactive_offset: None,
+                        inactive_softness: None,
+                        inactive_spread: None,
                     },
                     tab_indicator: TabIndicatorRule {
                         active_color: Some(
@@ -1848,6 +2286,42 @@ mod tests {
                         active_gradient: None,
                         inactive_gradient: None,
                         urgent_gradient: None,
+                    },
+                    titlebar: TitlebarRule {
+                        off: false,
+                        on: false,
+                        height: None,
+                        font: None,
+                        active_color: None,
+                        inactive_color: None,
+                        active_text_color: None,
+                        inactive_text_color: None,
+                        button_color: None,
+                        button_inactive_color: None,
+                        button_hover_color: None,
+                        button_icon_color: None,
+                        button_icon_inactive_color: None,
+                        button_icon_hover_color: None,
+                        button_styles: None,
+                        close_hover_color: None,
+                        button_hover_text_color: None,
+                        button_highlight: None,
+                        close_red: None,
+                        button_size: None,
+                        button_circle: None,
+                        icon_size: None,
+                        button_edge_gap: None,
+                        title_gap: None,
+                        button_hover_brighten: None,
+                        buttons_position: None,
+                        buttons: None,
+                        menu_command: None,
+                        menu_close_command: None,
+                        menu_namespace: None,
+                        icons: None,
+                        unified: None,
+                        transparent: None,
+                        button_hover_group: None,
                     },
                     draw_border_with_background: None,
                     opacity: None,
@@ -1919,6 +2393,9 @@ mod tests {
                         draw_behind_window: None,
                         color: None,
                         inactive_color: None,
+                        inactive_offset: None,
+                        inactive_softness: None,
+                        inactive_spread: None,
                     },
                     geometry_corner_radius: None,
                     place_within_backdrop: None,
@@ -2305,12 +2782,106 @@ mod tests {
                         b: 0.6,
                         a: 1.0,
                     },
+                    border_color: None,
+                    border_opacity: 1.0,
+                    background_color: Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                    background_opacity: 0.2,
                     padding: 15.0,
                     corner_radius: 0.0,
+                    border_width: 2.0,
                 },
                 previews: MruPreviews {
                     max_height: 960.0,
                     max_scale: 0.5,
+                    antialiasing: true,
+                    icons_only: false,
+                    flip: false,
+                    icon_size: 96.0,
+                    wrap: None,
+                    gap: 16.0,
+                },
+                scope_panel: MruScopePanel {
+                    off: false,
+                    background_color: Color {
+                        r: 0.1,
+                        g: 0.1,
+                        b: 0.1,
+                        a: 1.0,
+                    },
+                    background_opacity: 0.97,
+                    text_color: Color {
+                        r: 0.9,
+                        g: 0.9,
+                        b: 0.9,
+                        a: 1.0,
+                    },
+                    active_color: Color {
+                        r: 0.3137255,
+                        g: 0.5803922,
+                        b: 0.45882353,
+                        a: 1.0,
+                    },
+                    active_text_color: Color {
+                        r: 0.1,
+                        g: 0.1,
+                        b: 0.1,
+                        a: 1.0,
+                    },
+                    border_color: Color {
+                        r: 0.35,
+                        g: 0.35,
+                        b: 0.35,
+                        a: 1.0,
+                    },
+                    border_width: 1.0,
+                    corner_radius: 12.0,
+                    font: "Inter 14px",
+                },
+                container: MruContainer {
+                    background_color: Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                    background_opacity: 0.35,
+                    title_color: Color {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                    padding: 16.0,
+                    corner_radius: None,
+                    margin_x: 48.0,
+                    margin_y: 80.0,
+                    fullscreen: false,
+                    overlay_opacity: None,
+                    blur_radius: None,
+                },
+                label: MruLabel {
+                    text: None,
+                    show: None,
+                    font: "sans 14px",
+                    gap: 8.0,
+                },
+                flip: MruFlip {
+                    tilt_x: 23.0,
+                    tilt_y: 2.0,
+                    spacing: 44.0,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    front_x: 69.0,
+                    front_y: 60.0,
+                    camera_x: -15.0,
+                    camera_y: -32.0,
+                    card_size: 43.0,
+                    visible_windows: 10.0,
                 },
                 binds: [
                     Bind {
@@ -2379,6 +2950,238 @@ mod tests {
                         cooldown: None,
                         allow_when_locked: false,
                         allow_inhibiting: true,
+                        hotkey_overlay_title: None,
+                    },
+                ],
+                opened_binds: [
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Escape,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruCancel,
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Return,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruConfirm,
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_space,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruConfirm,
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_1,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruSetScope(
+                            All,
+                        ),
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_2,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruSetScope(
+                            Workspace,
+                        ),
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_3,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruSetScope(
+                            Output,
+                        ),
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_s,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruCycleScope,
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Home,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruFirst,
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_End,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruLast,
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Left,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruAdvance {
+                            direction: Backward,
+                            scope: None,
+                            filter: None,
+                        },
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Right,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruAdvance {
+                            direction: Forward,
+                            scope: None,
+                            filter: None,
+                        },
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Up,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruAdvance {
+                            direction: Up,
+                            scope: None,
+                            filter: None,
+                        },
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
+                        hotkey_overlay_title: None,
+                    },
+                    Bind {
+                        key: Key {
+                            trigger: Keysym(
+                                XK_Down,
+                            ),
+                            modifiers: Modifiers(
+                                0x0,
+                            ),
+                        },
+                        action: MruAdvance {
+                            direction: Down,
+                            scope: None,
+                            filter: None,
+                        },
+                        repeat: true,
+                        cooldown: None,
+                        allow_when_locked: false,
+                        allow_inhibiting: false,
                         hotkey_overlay_title: None,
                     },
                 ],

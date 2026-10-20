@@ -74,6 +74,11 @@ pub enum InitialConfigureState {
         /// window is also pending fullscreen, then it has the Fullscreen toplevel state, so we
         /// need to store pending maximized elsewhere, hence this field.
         is_pending_maximized: bool,
+
+        /// Whether `is_pending_maximized` came only from `layout { open-maximized-to-edges }`,
+        /// which leaves floating windows alone: a window that turns out floating when it maps
+        /// (a dialog that set its size limits late) is unmaximized back into floating.
+        maximized_by_layout: bool,
     },
 }
 

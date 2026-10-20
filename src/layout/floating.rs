@@ -636,9 +636,18 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let available_size = self.working_area.size.w;
 
         let len = self.options.layout.preset_column_widths.len();
+        let no_wrap = self.options.layout.preset_widths_no_wrap;
         let tile = &mut self.tiles[idx];
         let preset_idx = if let Some(idx) = tile.floating_preset_width_idx {
-            (idx + if forwards { 1 } else { len - 1 }) % len
+            if no_wrap {
+                if forwards {
+                    (idx + 1).min(len - 1)
+                } else {
+                    idx.saturating_sub(1)
+                }
+            } else {
+                (idx + if forwards { 1 } else { len - 1 }) % len
+            }
         } else {
             let current_window = tile.window_expected_or_current_size().w;
             let current_tile = tile.tile_expected_or_current_size().w;
@@ -658,7 +667,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
                         ResolvedSize::Window(resolved) => current_window + 1. < resolved,
                     }
                 })
-                .unwrap_or(0)
+                .unwrap_or(if no_wrap { len - 1 } else { 0 })
             } else {
                 it.rposition(|resolved| {
                     match resolved {
@@ -667,7 +676,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
                         ResolvedSize::Window(resolved) => resolved + 1. < current_window,
                     }
                 })
-                .unwrap_or(len - 1)
+                .unwrap_or(if no_wrap { 0 } else { len - 1 })
             }
         };
 
@@ -697,9 +706,18 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let available_size = self.working_area.size.h;
 
         let len = self.options.layout.preset_window_heights.len();
+        let no_wrap = self.options.layout.preset_heights_no_wrap;
         let tile = &mut self.tiles[idx];
         let preset_idx = if let Some(idx) = tile.floating_preset_height_idx {
-            (idx + if forwards { 1 } else { len - 1 }) % len
+            if no_wrap {
+                if forwards {
+                    (idx + 1).min(len - 1)
+                } else {
+                    idx.saturating_sub(1)
+                }
+            } else {
+                (idx + if forwards { 1 } else { len - 1 }) % len
+            }
         } else {
             let current_window = tile.window_expected_or_current_size().h;
             let current_tile = tile.tile_expected_or_current_size().h;
@@ -719,7 +737,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
                         ResolvedSize::Window(resolved) => current_window + 1. < resolved,
                     }
                 })
-                .unwrap_or(0)
+                .unwrap_or(if no_wrap { len - 1 } else { 0 })
             } else {
                 it.rposition(|resolved| {
                     match resolved {
@@ -728,7 +746,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
                         ResolvedSize::Window(resolved) => resolved + 1. < current_window,
                     }
                 })
-                .unwrap_or(len - 1)
+                .unwrap_or(if no_wrap { 0 } else { len - 1 })
             }
         };
 
@@ -1248,14 +1266,23 @@ impl<W: LayoutElement> FloatingSpace<W> {
     ) -> Size<i32, Logical> {
         let border = self.options.layout.border.merged_with(&rules.border);
 
-        let resolve = |size: Option<PresetSize>, working_area_size: f64| {
+        // Assume the window will take server-side decorations, as it will if it can.
+        let titlebar = self
+            .options
+            .layout
+            .titlebar
+            .clone()
+            .merged_with(&rules.titlebar);
+        let titlebar_height = if titlebar.off { 0. } else { titlebar.height };
+
+        let resolve = |size: Option<PresetSize>, working_area_size: f64, extra: f64| {
             if let Some(size) = size {
                 let size = match resolve_preset_size(size, working_area_size) {
                     ResolvedSize::Tile(mut size) => {
                         if !border.off {
                             size -= border.width * 2.;
                         }
-                        size
+                        size - extra
                     }
                     ResolvedSize::Window(size) => size,
                 };
@@ -1266,8 +1293,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
         };
 
-        let width = resolve(width, self.working_area.size.w);
-        let height = resolve(height, self.working_area.size.h);
+        let width = resolve(width, self.working_area.size.w, 0.);
+        let height = resolve(height, self.working_area.size.h, titlebar_height);
 
         Size::from((width, height))
     }

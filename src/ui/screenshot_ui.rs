@@ -30,6 +30,9 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::{render_to_texture, RenderTarget};
 use crate::utils::to_physical_precise_round;
 
+#[cfg(test)]
+mod tests;
+
 const SELECTION_BORDER: i32 = 2;
 
 const PADDING: i32 = 8;
@@ -41,6 +44,10 @@ const TEXT_HIDE_P: &str =
      Press <span face='mono' bgcolor='#2C2C2C'> P </span> to hide the pointer.";
 const TEXT_SHOW_P: &str =
     "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
+     Press <span face='mono' bgcolor='#2C2C2C'> P </span> to show the pointer.";
+const TEXT_RELEASE_HIDE_P: &str = "Drag and release to save the screenshot.\n\
+     Press <span face='mono' bgcolor='#2C2C2C'> P </span> to hide the pointer.";
+const TEXT_RELEASE_SHOW_P: &str = "Drag and release to save the screenshot.\n\
      Press <span face='mono' bgcolor='#2C2C2C'> P </span> to show the pointer.";
 
 // Ideally the screenshot UI should support cross-output selections. However, that poses some
@@ -57,6 +64,8 @@ pub enum ScreenshotUi {
     },
     Open {
         selection: (Output, Point<i32, Physical>, Point<i32, Physical>),
+        selection_visible: bool,
+        settings: niri_config::ScreenshotUi,
         output_data: HashMap<Output, OutputData>,
         button: Button,
         show_pointer: bool,
@@ -157,8 +166,10 @@ impl ScreenshotUi {
             return false;
         };
 
+        let settings = config.borrow().screenshot_ui;
         let last_selection = last_selection
             .take()
+            .filter(|_| settings.remember_selection)
             .and_then(|(weak, sel)| weak.upgrade().map(|output| (output, sel)));
         let selection = match last_selection {
             Some(selection) if screenshots.contains_key(&selection.0) => selection,
@@ -207,9 +218,17 @@ impl ScreenshotUi {
                         .map_err(|err| warn!("error rendering help panel: {err:?}"))
                         .ok()
                 };
-                let panel_show = render_panel_(TEXT_SHOW_P);
-                let panel_hide = render_panel_(TEXT_HIDE_P);
-                let panel = Option::zip(panel_show, panel_hide);
+                // No textures, render elements or invisible hit targets when disabled.
+                let panel = if settings.show_panel {
+                    let (show, hide) = if settings.capture_on_release {
+                        (TEXT_RELEASE_SHOW_P, TEXT_RELEASE_HIDE_P)
+                    } else {
+                        (TEXT_SHOW_P, TEXT_HIDE_P)
+                    };
+                    Option::zip(render_panel_(show), render_panel_(hide))
+                } else {
+                    None
+                };
 
                 let data = OutputData {
                     size,
@@ -231,6 +250,8 @@ impl ScreenshotUi {
 
         *self = Self::Open {
             selection,
+            selection_visible: settings.remember_selection,
+            settings,
             output_data,
             button: Button::Up,
             show_pointer,
@@ -248,6 +269,8 @@ impl ScreenshotUi {
     pub fn close(&mut self) -> bool {
         let Self::Open {
             selection,
+            selection_visible,
+            settings,
             clock,
             config,
             ..
@@ -256,10 +279,12 @@ impl ScreenshotUi {
             return false;
         };
 
-        let last_selection = Some((
-            selection.0.downgrade(),
-            rect_from_corner_points(selection.1, selection.2),
-        ));
+        let last_selection = (settings.remember_selection && *selection_visible).then(|| {
+            (
+                selection.0.downgrade(),
+                rect_from_corner_points(selection.1, selection.2),
+            )
+        });
 
         *self = Self::Closed {
             last_selection,
@@ -278,6 +303,26 @@ impl ScreenshotUi {
 
     pub fn is_open(&self) -> bool {
         matches!(self, ScreenshotUi::Open { .. })
+    }
+
+    /// There is no implicit capture target until a selection is drawn or adjusted.
+    pub fn has_selection(&self) -> bool {
+        matches!(
+            self,
+            Self::Open {
+                selection_visible: true,
+                ..
+            }
+        )
+    }
+
+    fn reveal_selection(&mut self) {
+        if let Self::Open {
+            selection_visible, ..
+        } = self
+        {
+            *selection_visible = true;
+        }
     }
 
     pub fn set_space_down(&mut self, down: bool) {
@@ -312,6 +357,7 @@ impl ScreenshotUi {
     }
 
     pub fn move_left(&mut self) {
+        self.reveal_selection();
         let Self::Open {
             selection: (output, a, b),
             output_data,
@@ -332,6 +378,7 @@ impl ScreenshotUi {
     }
 
     pub fn move_right(&mut self) {
+        self.reveal_selection();
         let Self::Open {
             selection: (output, a, b),
             output_data,
@@ -352,6 +399,7 @@ impl ScreenshotUi {
     }
 
     pub fn move_up(&mut self) {
+        self.reveal_selection();
         let Self::Open {
             selection: (output, a, b),
             output_data,
@@ -372,6 +420,7 @@ impl ScreenshotUi {
     }
 
     pub fn move_down(&mut self) {
+        self.reveal_selection();
         let Self::Open {
             selection: (output, a, b),
             output_data,
@@ -461,6 +510,7 @@ impl ScreenshotUi {
     }
 
     pub fn set_width(&mut self, change: SizeChange) {
+        self.reveal_selection();
         let Self::Open {
             selection: (output, a, b),
             output_data,
@@ -499,6 +549,7 @@ impl ScreenshotUi {
     }
 
     pub fn set_height(&mut self, change: SizeChange) {
+        self.reveal_selection();
         let Self::Open {
             selection: (output, a, b),
             output_data,
@@ -549,6 +600,7 @@ impl ScreenshotUi {
     fn update_buffers(&mut self) {
         let Self::Open {
             selection,
+            selection_visible,
             output_data,
             ..
         } = self
@@ -565,7 +617,7 @@ impl ScreenshotUi {
             let size = data.size;
             let scale = data.scale;
 
-            if output == selection_output {
+            if *selection_visible && output == selection_output {
                 // Check if the selection is still valid. If not, reset it back to default.
                 if !Rectangle::from_size(size).contains_rect(rect) {
                     rect = Rectangle::new(
@@ -774,7 +826,11 @@ impl ScreenshotUi {
             return None;
         }
 
-        action(raw, mods)
+        let action = action(raw, mods)?;
+        if matches!(action, Action::ConfirmScreenshot { .. }) && !self.has_selection() {
+            return None;
+        }
+        Some(action)
     }
 
     pub fn selection_output(&self) -> Option<&Output> {
@@ -852,6 +908,7 @@ impl ScreenshotUi {
     ) -> bool {
         let Self::Open {
             selection,
+            selection_visible,
             output_data,
             show_pointer,
             button,
@@ -910,6 +967,7 @@ impl ScreenshotUi {
             move_state: None,
         };
         *selection = (output, point, point);
+        *selection_visible = true;
 
         self.update_buffers();
 
@@ -919,6 +977,8 @@ impl ScreenshotUi {
     pub fn pointer_up(&mut self, slot: Option<TouchSlot>) -> Option<bool> {
         let Self::Open {
             selection,
+            selection_visible,
+            settings,
             output_data,
             button,
             show_pointer,
@@ -978,6 +1038,13 @@ impl ScreenshotUi {
         // default rectangle.
         let (output, a, b) = selection;
         let mut rect = rect_from_corner_points(*a, *b);
+        // A click or a zero-width/height drag must not accidentally capture.
+        // Wait for another drag instead of manufacturing a 32px screenshot.
+        if settings.capture_on_release && (rect.size.w <= 1 || rect.size.h <= 1) {
+            *selection_visible = false;
+            self.update_buffers();
+            return Some(false);
+        }
         if rect.size.is_empty() || rect.size == Size::from((1, 1)) {
             let data = &output_data[output];
             rect = Rectangle::new(
@@ -990,9 +1057,10 @@ impl ScreenshotUi {
             *b = rect.loc + rect.size - Size::from((1, 1));
         }
 
+        let capture = settings.capture_on_release && !on_capture_button;
         self.update_buffers();
 
-        Some(false)
+        Some(capture)
     }
 }
 
