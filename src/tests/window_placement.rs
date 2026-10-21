@@ -1,11 +1,11 @@
 //! Windows reopened at login open straight where they were (`Request::PlaceWindows`).
 
 use niri_ipc::{WindowPlacement, WindowPlacements, WorkspaceReferenceArg};
+use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::*;
 use crate::layout::workspace::WorkspaceId;
-use wayland_client::protocol::wl_surface::WlSurface;
 
 fn saved(app: &str, workspace: u8, column: u32, tile: u32) -> WindowPlacement {
     WindowPlacement {

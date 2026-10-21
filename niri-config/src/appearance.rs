@@ -1666,13 +1666,13 @@ impl Default for Titlebar {
     }
 }
 
-/// Title bar button icons: a built-in Phosphor name (`x`, `square`, `cards`, `square-split-horizontal`,
-/// `plus`, `minus`,
+/// Title bar button icons: a built-in Phosphor name (`x`, `square`, `cards`,
+/// `square-split-horizontal`, `plus`, `minus`,
 /// `arrows-out-simple`, `arrows-in-simple`, `corners-out`, `corners-in`,
-/// `arrows-out-line-horizontal`, `dots-three`) or an SVG file (`~/...` or absolute: its `<path>`s, filled, or
-/// stroked when the SVG says `fill="none"`), read when the config loads. The `-active` ones are
-/// shown while the toggle is on (zoom and maximize: maximized or fullscreen; float: floating;
-/// fullscreen: fullscreen), the plain one when unset.
+/// `arrows-out-line-horizontal`, `dots-three`) or an SVG file (`~/...` or absolute: its `<path>`s,
+/// filled, or stroked when the SVG says `fill="none"`), read when the config loads. The `-active`
+/// ones are shown while the toggle is on (zoom and maximize: maximized or fullscreen; float:
+/// floating; fullscreen: fullscreen), the plain one when unset.
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
 pub struct TitlebarIcons {
     #[knuffel(child, unwrap(argument))]

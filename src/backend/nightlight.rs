@@ -4,11 +4,12 @@
 //! direct scanout, layers and cursors; no renderer or thumbnail changes needed.
 //! Composition is C * N for column RGB vectors: apply temperature in source RGB,
 //! then the captured calibration C. Disable restores C byte-for-byte, not identity.
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use anyhow::{bail, ensure, Context};
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd};
 use smithay::reexports::drm::control::{crtc, property, Device};
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 
 pub type Matrix = [u64; 9];
 const ONE: u64 = 1 << 32;
@@ -535,9 +536,10 @@ pub fn aggregate(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+
+    use super::*;
 
     #[derive(Clone, Default)]
     struct Fake {
