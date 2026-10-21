@@ -688,14 +688,14 @@ impl BackdropBlur {
             self.config = Some((config, strength, radius, geometry));
             self.effect.damage();
         }
-        if config.off {
+        if config.is_off() {
             return None;
         }
         // A radius, as the overview's backdrop blur: passes and offset worked
         // out from it, the faintest faded in rather than jumping.
         let (options, alpha) = match strength {
             Some(strength) => ramped_blur(strength * scale)?,
-            None => (BlurOptions::from(config), 1.),
+            None => (BlurOptions::global(config, scale), 1.),
         };
         let radius = radius.fit_to(geometry.size.w as f32, geometry.size.h as f32);
         let elem = self.effect.render(

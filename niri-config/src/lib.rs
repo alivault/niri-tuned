@@ -702,6 +702,34 @@ mod tests {
     }
 
     #[test]
+    fn blur_radius_parses_and_the_strength_set_last_wins() {
+        let config = do_parse("blur { noise 0.05; }");
+        assert_eq!(config.blur.radius, None);
+        assert_eq!((config.blur.passes, config.blur.offset), (3, 3.));
+
+        let config = do_parse("blur { radius 48; }");
+        assert_eq!(config.blur.radius, Some(48.));
+        assert_eq!(config.blur.noise, 0.02);
+
+        // The user's radius over the defaults' passes and offset, and the other way round.
+        let config = parse_layered("blur { passes 2; offset 4; }", "blur { radius 8; }");
+        assert_eq!(config.blur.radius, Some(8.));
+        let config = parse_layered("blur { radius 8; }", "blur { passes 2; }");
+        assert_eq!((config.blur.radius, config.blur.passes), (None, 2));
+        // Noise or saturation alone keep an earlier radius.
+        let config = parse_layered("blur { radius 8; }", "blur { saturation 1.2; }");
+        assert_eq!(config.blur.radius, Some(8.));
+
+        // 0 is no blur.
+        let config = do_parse("blur { radius 0; }");
+        assert!(config.blur.is_off());
+        assert!(!do_parse("blur { radius 2; }").blur.is_off());
+
+        assert!(Config::parse_mem("blur { radius -1; }").is_err());
+        assert!(Config::parse_mem("blur { radius 2000; }").is_err());
+    }
+
+    #[test]
     fn layered_overview_blur_and_highlight_merge_setting_by_setting() {
         // A desktop's defaults turn them on; the user's config changes one setting or turns
         // one off again.
@@ -2042,6 +2070,7 @@ mod tests {
                 off: false,
                 passes: 3,
                 offset: 3.0,
+                radius: None,
                 noise: 0.02,
                 saturation: 1.5,
             },

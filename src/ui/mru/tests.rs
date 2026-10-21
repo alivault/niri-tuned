@@ -84,6 +84,37 @@ fn backdrop_blur_is_live_fullscreen_and_hot_reloadable() {
 }
 
 #[test]
+fn switcher_blur_follows_a_global_radius_only_when_it_has_none_of_its_own() {
+    use smithay::backend::renderer::element::Element;
+
+    use crate::render_helpers::blur::ramped_blur;
+
+    let mut blur = BackdropBlur::new();
+    let mut config = niri_config::Blur::default();
+    let geometry = Rectangle::from_size(Size::new(1280., 800.));
+    let radius = CornerRadius::default();
+    let commit = |blur: &mut BackdropBlur, config, strength| {
+        blur.render(config, strength, geometry, radius, 2.)
+            .map(|(elem, alpha)| (elem.current_commit(), alpha))
+    };
+    let first = commit(&mut blur, config, None).unwrap().0;
+    // Hot reload: a new global radius redraws a switcher without a strength of its own.
+    config.radius = Some(40.);
+    let second = commit(&mut blur, config, None).unwrap().0;
+    assert_ne!(second, first);
+    assert_eq!(commit(&mut blur, config, None).unwrap().0, second);
+    // Its own strength is ramped as before, whatever the global radius.
+    assert_eq!(
+        commit(&mut blur, config, Some(20.)).unwrap().1,
+        ramped_blur(40.).unwrap().1
+    );
+    // A global radius of 0 is no blur, as `off`.
+    config.radius = Some(0.);
+    assert!(commit(&mut blur, config, None).is_none());
+    assert!(commit(&mut blur, config, Some(20.)).is_none());
+}
+
+#[test]
 fn a_small_preview_gets_a_tile_wide_enough_for_its_title() {
     let small = Rectangle::new(Point::new(500., 100.), Size::new(35., 70.));
     // Widened about its centre, as far as the cells allow.

@@ -28,11 +28,16 @@ pub struct BlurOptions {
     pub offset: f64,
 }
 
-impl From<niri_config::Blur> for BlurOptions {
-    fn from(config: niri_config::Blur) -> Self {
-        Self {
-            passes: config.passes,
-            offset: config.offset,
+impl BlurOptions {
+    /// The global blur on an output of this scale: its `radius` (logical pixels) if set,
+    /// else its `passes` and `offset` (physical, whatever the scale, as upstream).
+    pub fn global(config: niri_config::Blur, scale: f64) -> Self {
+        match config.radius {
+            Some(radius) => static_blur(radius * scale),
+            None => Self {
+                passes: config.passes,
+                offset: config.offset,
+            },
         }
     }
 }
@@ -380,6 +385,21 @@ pub fn ramped_blur(radius: f64) -> Option<(BlurOptions, f32)> {
     Some((options, 1.))
 }
 
+/// The blur for `radius` (physical pixels) where it can't fade in (windows, layers, the
+/// cached xray background): as [`ramped_blur`], but a radius below the smallest blur one
+/// pass makes is that smallest blur (a radius of 0 is no blur: [`niri_config::Blur::is_off`]).
+pub fn static_blur(radius: f64) -> BlurOptions {
+    let smallest = RAMP_MIN_OFFSET * 2.;
+    let radius = if radius >= smallest { radius } else { smallest };
+    ramped_blur(radius).map_or(
+        BlurOptions {
+            passes: 1,
+            offset: RAMP_MIN_OFFSET,
+        },
+        |(options, _)| options,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +452,61 @@ mod tests {
         let (at, _) = ramped_blur(edge).unwrap();
         assert_eq!(below.passes + 1, at.passes);
         assert!((spread(below) - spread(at)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn global_blur_radius_replaces_passes_and_offset() {
+        let config = niri_config::Blur::default();
+        let defaults = BlurOptions {
+            passes: 3,
+            offset: 3.,
+        };
+        // Unset: passes and offset as they are, at any scale.
+        assert_eq!(BlurOptions::global(config, 1.), defaults);
+        assert_eq!(BlurOptions::global(config, 2.), defaults);
+
+        // Logical pixels: twice the spread at scale 2.
+        let at = |radius, scale| {
+            BlurOptions::global(
+                niri_config::Blur {
+                    radius: Some(radius),
+                    ..config
+                },
+                scale,
+            )
+        };
+        assert!((spread(at(40., 1.)) - 40.).abs() < 1e-6);
+        assert!((spread(at(40., 2.)) - 80.).abs() < 1e-6);
+        assert!((spread(at(12., 2.)) - 24.).abs() < 1e-6);
+        for radius in [6., 8., 64., 96., 1024.] {
+            assert_eq!(
+                at(radius, 1.),
+                ramped_blur(radius).unwrap().0,
+                "radius {radius}"
+            );
+        }
+
+        // Too faint to blur at full strength: the smallest blur, never none (0 is `off`).
+        let smallest = BlurOptions {
+            passes: 1,
+            offset: RAMP_MIN_OFFSET,
+        };
+        for radius in [0.5, 1., 1.5] {
+            assert_eq!(at(radius, 2.), smallest, "radius {radius}");
+        }
+        assert!(at(2., 2.).passes >= 1);
+    }
+
+    #[test]
+    fn a_global_blur_radius_of_0_is_no_blur() {
+        let mut config = niri_config::Blur::default();
+        assert!(!config.is_off());
+        config.radius = Some(2.);
+        assert!(!config.is_off());
+        config.radius = Some(0.);
+        assert!(config.is_off());
+        config.radius = None;
+        config.off = true;
+        assert!(config.is_off());
     }
 }

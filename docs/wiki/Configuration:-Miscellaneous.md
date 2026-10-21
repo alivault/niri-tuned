@@ -493,6 +493,24 @@ blur {
 }
 ```
 
+#### `radius`
+
+niri-tuned: one number for how strong the blur is, instead of `passes` and `offset`.
+It is how far the blur spreads, in logical pixels as the overview's `backdrop-blur` `radius`, 0 to 1024.
+`passes` and `offset` are worked out from it at each output's scale (the spread is about `offset × 2^passes`), so the blur grows evenly with it.
+At scale 1, `radius 24` blurs about as far as the defaults (3 passes at offset 3); at scale 2, `radius 12` does.
+`radius 0` is no blur, as `off`; a radius too small for one pass gives the smallest blur (1 pass).
+
+Set, it replaces `passes` and `offset`; across included files, the strength set last wins (a `radius`, or `passes` or `offset` after it).
+Every background blur follows it: windows, title bars, layer surfaces, and the window switcher unless `recent-windows { container { blur-radius } }` sets its own.
+Changes apply live.
+
+```kdl
+blur {
+    radius 40
+}
+```
+
 #### `noise`
 
 Amount of noise to add on top of the blur.

@@ -270,8 +270,8 @@ impl BackgroundEffect {
 
         // Use noise/saturation from options, falling back to blur defaults if blurred, and
         // to no effect if not blurred.
-        let blur = self.options.blur && !self.blur_config.off;
-        let blur_options = blur.then_some(BlurOptions::from(self.blur_config));
+        let blur = self.options.blur && !self.blur_config.is_off();
+        let blur_options = blur.then_some(BlurOptions::global(self.blur_config, params.scale));
         let noise = if blur { self.blur_config.noise } else { 0. };
         let noise = self.options.noise.unwrap_or(noise) as f32;
         let saturation = if blur {
@@ -529,6 +529,28 @@ mod tests {
 
     fn at(clock: &mut Clock, ms: u64) {
         clock.set_unadjusted(Duration::from_millis(ms));
+    }
+
+    #[test]
+    fn global_blur_radius_change_damages_the_effect() {
+        use smithay::backend::renderer::element::Element as _;
+
+        let mut effect = BackgroundEffect::new();
+        let mut config = niri_config::Blur::default();
+        effect.update_config(config);
+        let first = effect.damage.current_commit();
+
+        // Hot reload: a new radius redraws the blur behind windows and layers.
+        config.radius = Some(64.);
+        effect.update_config(config);
+        let second = effect.damage.current_commit();
+        assert_ne!(second, first);
+        // The same config again: nothing to redraw.
+        effect.update_config(config);
+        assert_eq!(effect.damage.current_commit(), second);
+        config.radius = Some(8.);
+        effect.update_config(config);
+        assert_ne!(effect.damage.current_commit(), second);
     }
 
     #[test]

@@ -4192,7 +4192,7 @@ impl Niri {
                     state.xray.workspaces.push((geo, bg_color));
                 }
                 state.xray.backdrop_color = state.backdrop_buffer.color();
-                let blur_options = BlurOptions::from(self.config.borrow().blur);
+                let blur_options = BlurOptions::global(self.config.borrow().blur, scale.x);
                 for buf in &state.xray.background {
                     let mut buffer = buf.borrow_mut();
                     buffer.update_size(size, scale);

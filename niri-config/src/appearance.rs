@@ -1197,6 +1197,10 @@ pub struct Blur {
     pub off: bool,
     pub passes: u8,
     pub offset: f64,
+    /// How far the blur spreads, in logical pixels (as the overview's backdrop blur). Set,
+    /// it replaces `passes` and `offset`: they are worked out from it at each output's
+    /// scale (spread ≈ offset × 2^passes). 0: no blur, as `off`.
+    pub radius: Option<f64>,
     pub noise: f64,
     pub saturation: f64,
 }
@@ -1207,6 +1211,7 @@ impl Default for Blur {
             off: false,
             passes: 3,
             offset: 3.,
+            radius: None,
             noise: 0.02,
             saturation: 1.5,
         }
@@ -1224,9 +1229,18 @@ pub struct BlurPart {
     #[knuffel(child, unwrap(argument))]
     pub offset: Option<FloatOrInt<0, 100>>,
     #[knuffel(child, unwrap(argument))]
+    pub radius: Option<FloatOrInt<0, 1024>>,
+    #[knuffel(child, unwrap(argument))]
     pub noise: Option<FloatOrInt<0, 1000>>,
     #[knuffel(child, unwrap(argument))]
     pub saturation: Option<FloatOrInt<0, 1000>>,
+}
+
+impl Blur {
+    /// No blur at all: `off`, or a `radius` of 0.
+    pub fn is_off(&self) -> bool {
+        self.off || self.radius.is_some_and(|radius| radius <= 0.)
+    }
 }
 
 impl MergeWith<BlurPart> for Blur {
@@ -1238,6 +1252,14 @@ impl MergeWith<BlurPart> for Blur {
 
         merge_clone!((self, part), passes);
         merge!((self, part), offset, noise, saturation);
+
+        // The strength set last wins: a radius, or passes and offset over an earlier
+        // layer's radius.
+        if let Some(radius) = part.radius {
+            self.radius = Some(radius.0);
+        } else if part.passes.is_some() || part.offset.is_some() {
+            self.radius = None;
+        }
     }
 }
 
