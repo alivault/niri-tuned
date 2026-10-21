@@ -27,13 +27,13 @@ tracy-client = { version = "0.18.4", default-features = false }
 
 [workspace.dependencies.smithay]
 # version = "0.4.1"
-git = "file:///home/ali/code/niri-nightlight-smithay"
+git = "https://github.com/alivault/smithay.git"
 rev = "cf416bfa131a9f27eabc9a0bc00b7472b73b6fad"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
 # version = "0.1.0"
-git = "file:///home/ali/code/niri-nightlight-smithay"
+git = "https://github.com/alivault/smithay.git"
 rev = "cf416bfa131a9f27eabc9a0bc00b7472b73b6fad"
 # path = "../smithay/smithay-drm-extras"
 
