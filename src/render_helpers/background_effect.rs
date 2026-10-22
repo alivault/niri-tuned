@@ -281,7 +281,7 @@ impl BackgroundEffect {
         };
         let saturation = self.options.saturation.unwrap_or(saturation) as f32;
 
-        if self.options.xray {
+        if self.options.xray || (xray_pos.prefer_xray && ctx.xray.is_some()) {
             let Some(xray) = ctx.xray else {
                 return;
             };

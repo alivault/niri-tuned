@@ -24,8 +24,13 @@ use super::shaders::Shaders;
 use crate::animation::wobbly::evaluate;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
-/// Mesh cells along each side of the picture.
-const CELLS: usize = 16;
+/// Longest mesh cell side, in physical pixels: short enough that a bent edge shows no corners
+/// (the curve leaves a 24 px chord by well under a pixel).
+const CELL_PX: f64 = 24.;
+/// Fewest and most cells along a side (the most keeps vertex indices in 16 bits).
+const MIN_CELLS: usize = 8;
+const MAX_CELLS: usize = 128;
+const _: () = assert!((MAX_CELLS + 1) * (MAX_CELLS + 1) <= u16::MAX as usize + 1);
 /// Floats per vertex: position (0 to 1 across the element), texture coordinates.
 const STRIDE: usize = 4;
 
@@ -72,8 +77,10 @@ pub struct WobblyRenderElement {
     renderer_context_id: ContextId<GlesTexture>,
     /// The box around the bent picture, physical.
     geometry: Rectangle<i32, Physical>,
-    /// Triangles, `STRIDE` floats a vertex.
+    /// The mesh's vertices, `STRIDE` floats each, rows first.
     vertices: Rc<[f32]>,
+    /// Its triangles, three vertex indices each.
+    indices: Rc<[u16]>,
     alpha: f32,
 }
 
@@ -119,12 +126,14 @@ impl WobblyRenderElement {
         let picture_size = DVec2::new(size.w, size.h);
         let location = DVec2::new(location.x, location.y);
 
-        let n = CELLS + 1;
-        let mut grid = Vec::with_capacity(n * n);
+        let cells = |px: f64| ((px / CELL_PX).ceil() as usize).clamp(MIN_CELLS, MAX_CELLS);
+        let (cx, cy) = (cells(src.w), cells(src.h));
+        let (nx, ny) = (cx + 1, cy + 1);
+        let mut grid = Vec::with_capacity(nx * ny);
         let (mut lo, mut hi) = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
-        for j in 0..n {
-            for i in 0..n {
-                let s = DVec2::new(i as f64, j as f64) / CELLS as f64;
+        for j in 0..ny {
+            for i in 0..nx {
+                let s = DVec2::new(i as f64 / cx as f64, j as f64 / cy as f64);
                 let s = -pad + s * (DVec2::ONE + 2. * pad);
                 let on_tile = (origin + s * picture_size) / tile;
                 let p = (location + evaluate(points, on_tile.x, on_tile.y)) * scale.x;
@@ -147,16 +156,16 @@ impl WobblyRenderElement {
         let geo_loc = DVec2::new(geometry.loc.x as f64, geometry.loc.y as f64);
         let geo_size = DVec2::new(geometry.size.w as f64, geometry.size.h as f64);
 
-        let mut vertices = Vec::with_capacity(CELLS * CELLS * 6 * STRIDE);
-        let mut push = |i: usize, j: usize| {
-            let (p, t) = grid[j * n + i];
+        let mut vertices = Vec::with_capacity(grid.len() * STRIDE);
+        for (p, t) in grid {
             let p = (p - geo_loc) / geo_size;
             vertices.extend_from_slice(&[p.x as f32, p.y as f32, t.x as f32, t.y as f32]);
-        };
-        for j in 0..CELLS {
-            for i in 0..CELLS {
+        }
+        let mut indices = Vec::with_capacity(cx * cy * 6);
+        for j in 0..cy {
+            for i in 0..cx {
                 for (di, dj) in [(0, 0), (1, 0), (0, 1), (0, 1), (1, 0), (1, 1)] {
-                    push(i + di, j + dj);
+                    indices.push(((j + dj) * nx + i + di) as u16);
                 }
             }
         }
@@ -169,6 +178,7 @@ impl WobblyRenderElement {
             renderer_context_id: renderer.context_id(),
             geometry,
             vertices: vertices.into(),
+            indices: indices.into(),
             alpha,
         })
     }
@@ -206,7 +216,8 @@ impl WobblyRenderElement {
         let tex_id = self.texture.tex_id();
         let alpha = self.alpha;
         let vertices = self.vertices.clone();
-        let count = (vertices.len() / STRIDE) as i32;
+        let indices = self.indices.clone();
+        let count = indices.len() as i32;
         let damage: Vec<_> = damage
             .iter()
             .filter_map(|rect| rect.intersection(Rectangle::from_size(dst.size)))
@@ -246,6 +257,7 @@ impl WobblyRenderElement {
             let tex_coords = program.attrib_tex_coords as u32;
             let stride = (STRIDE * std::mem::size_of::<f32>()) as i32;
             gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
+            gl.BindBuffer(ffi::ELEMENT_ARRAY_BUFFER, 0);
             gl.EnableVertexAttribArray(position);
             gl.VertexAttribPointer(
                 position,
@@ -278,7 +290,12 @@ impl WobblyRenderElement {
                     continue;
                 }
                 gl.Scissor(x, y, w, h);
-                gl.DrawArrays(ffi::TRIANGLES, 0, count);
+                gl.DrawElements(
+                    ffi::TRIANGLES,
+                    count,
+                    ffi::UNSIGNED_SHORT,
+                    indices.as_ptr().cast(),
+                );
             }
             gl.Scissor(viewport[0], viewport[1], viewport[2], viewport[3]);
 

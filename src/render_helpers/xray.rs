@@ -40,6 +40,10 @@ pub struct XrayPos {
 
     /// Zoom factor between backdrop coordinates and geometry.
     pub zoom: f64,
+
+    /// Draw non-xray background effects as xray too: the geometry is drawn offscreen (a
+    /// wobbly window), where there is no framebuffer behind it to blur.
+    pub prefer_xray: bool,
 }
 
 impl XrayPos {
@@ -47,7 +51,13 @@ impl XrayPos {
         Self {
             pos_in_backdrop: pos_in_backdrop.downscale(zoom),
             zoom,
+            prefer_xray: false,
         }
+    }
+
+    pub fn preferring_xray(mut self) -> Self {
+        self.prefer_xray = true;
+        self
     }
 
     pub fn offset(mut self, offset: Point<f64, Logical>) -> Self {
@@ -61,6 +71,7 @@ impl Default for XrayPos {
         Self {
             pos_in_backdrop: Point::new(0., 0.),
             zoom: 1.,
+            prefer_xray: false,
         }
     }
 }

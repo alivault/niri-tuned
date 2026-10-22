@@ -1813,18 +1813,27 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed = false;
         self.window().set_offscreen_data(None);
 
+        // A wobbly window is drawn offscreen, with nothing behind it to blur: its blur shows the
+        // blurred backdrop (xray) instead.
+        let wobbling = self.is_wobbling();
+        let inner_xray_pos = if wobbling {
+            xray_pos.preferring_xray()
+        } else {
+            xray_pos
+        };
+
         if let Some(open) = &self.open_animation {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
                 Point::new(0., 0.),
-                xray_pos,
+                inner_xray_pos,
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
             // An opening window shivers inside its open animation.
-            if self.is_wobbling() {
+            if wobbling {
                 if let Some((elem, _data)) =
                     self.render_wobbly(ctx.renderer, &elements, Point::new(0., 0.), 1.)
                 {
@@ -1848,14 +1857,14 @@ impl<W: LayoutElement> Tile<W> {
                     warn!("error rendering window opening animation: {err:?}");
                 }
             }
-        } else if self.is_wobbling() {
+        } else if wobbling {
             // Bent, with the alpha animation's alpha if there is one (an interactive move).
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
                 Point::new(0., 0.),
-                xray_pos,
+                inner_xray_pos,
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );

@@ -475,6 +475,7 @@ Compiz-style wobbly windows, on by default.
 A window is a 4 × 4 grid of masses on springs (Compiz's model).
 While you drag a window, the point you hold follows the pointer and the rest of the window lags behind and swings back; when you let go, it settles.
 The window's border, focus ring, shadow, title bar and rounded corners bend with it.
+While it wobbles, a see-through window's blur shows the blurred backdrop, as with `xray`: the bent window is drawn offscreen, with nothing behind it to blur.
 The physics runs on the animation clock, so `slowdown` slows it and `off` turns it off.
 
 - `off`: no wobbling.
