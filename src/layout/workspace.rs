@@ -1394,6 +1394,28 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    /// Whether the window is pending maximized to edges, and fullscreen (it can be both).
+    pub fn pending_maximized_and_fullscreen(&self, window: &W::Id) -> (bool, bool) {
+        // Only scrolling columns can be maximized or fullscreen.
+        self.scrolling
+            .columns()
+            .find(|col| col.contains(window))
+            .map_or((false, false), |col| {
+                (col.is_pending_maximized(), col.is_pending_fullscreen())
+            })
+    }
+
+    /// Gives a moved window back the maximize and fullscreen it had before the move.
+    pub fn restore_sizing_after_move(&mut self, window: &W::Id, maximize: bool, fullscreen: bool) {
+        // Maximize first: a window both maximized and fullscreen unfullscreens to maximized.
+        if maximize {
+            self.set_maximized(window, true);
+        }
+        if fullscreen {
+            self.set_fullscreen(window, true);
+        }
+    }
+
     pub fn toggle_maximized(&mut self, window: &W::Id) {
         let mut current = false;
 

@@ -1,5 +1,6 @@
 use std::cmp::{max, min};
 use std::iter::{self, zip};
+use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -1092,8 +1093,11 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // If this is the only tile in the column, remove the whole column.
         if self.columns[column_idx].tiles.len() == 1 {
             let mut column = self.remove_column_by_idx(column_idx, anim_config);
+            let mut tile = column.tiles.remove(tile_idx);
+            tile.unfullscreen_to_maximized =
+                column.is_pending_fullscreen && column.is_pending_maximized;
             return RemovedTile {
-                tile: column.tiles.remove(tile_idx),
+                tile,
                 width: column.width,
                 is_full_width: column.is_full_width,
                 is_floating: false,
@@ -1121,8 +1125,10 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let was_normal = column.sizing_mode().is_normal();
 
-        let tile = column.tiles.remove(tile_idx);
+        let mut tile = column.tiles.remove(tile_idx);
         column.data.remove(tile_idx);
+        tile.unfullscreen_to_maximized =
+            column.is_pending_fullscreen && column.is_pending_maximized;
 
         // If an active column became non-fullscreen after removing the tile, clear the stored
         // unfullscreen offset.
@@ -4016,7 +4022,7 @@ impl WindowHeight {
 impl<W: LayoutElement> Column<W> {
     #[allow(clippy::too_many_arguments)]
     fn new_with_tile(
-        tile: Tile<W>,
+        mut tile: Tile<W>,
         view_size: Size<f64, Logical>,
         working_area: Rectangle<f64, Logical>,
         parent_area: Rectangle<f64, Logical>,
@@ -4069,13 +4075,20 @@ impl<W: LayoutElement> Column<W> {
         };
 
         let pending_sizing_mode = tile.window().pending_sizing_mode();
+        let unfullscreen_to_maximized = mem::take(&mut tile.unfullscreen_to_maximized);
 
         rv.add_tile_at(0, tile);
 
         match pending_sizing_mode {
             SizingMode::Normal => (),
             SizingMode::Maximized => rv.set_maximized(true),
-            SizingMode::Fullscreen => rv.set_fullscreen(true),
+            SizingMode::Fullscreen => {
+                // The tile came from a maximized and fullscreen column: keep both.
+                if unfullscreen_to_maximized {
+                    rv.is_pending_maximized = true;
+                }
+                rv.set_fullscreen(true);
+            }
         }
 
         // Animate the tab indicator for new columns.
@@ -4238,6 +4251,11 @@ impl<W: LayoutElement> Column<W> {
         self.is_pending_maximized
     }
 
+    #[cfg(test)]
+    pub fn is_full_width(&self) -> bool {
+        self.is_full_width
+    }
+
     pub fn pending_sizing_mode(&self) -> SizingMode {
         if self.is_pending_fullscreen {
             SizingMode::Fullscreen
@@ -4391,6 +4409,8 @@ impl<W: LayoutElement> Column<W> {
 
     fn add_tile_at(&mut self, idx: usize, mut tile: Tile<W>) {
         tile.update_config(self.view_size, self.scale, self.options.clone());
+        // Joining an existing column takes that column's state.
+        tile.unfullscreen_to_maximized = false;
 
         // Inserting a tile pushes down all tiles below it, but also in always-centering mode it
         // will affect the X position of all tiles in the column.

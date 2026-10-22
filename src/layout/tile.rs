@@ -109,6 +109,13 @@ pub struct Tile<W: LayoutElement> {
     /// Whether the tile should float upon unfullscreening.
     pub(super) restore_to_floating: bool,
 
+    /// Whether the tile left a column that was both maximized and fullscreen.
+    ///
+    /// A window is either maximized or fullscreen; when it is both, only its column knows it is
+    /// also maximized. This carries that to the new column when the tile moves (to another
+    /// workspace or monitor), so unfullscreening there returns it to maximized.
+    pub(super) unfullscreen_to_maximized: bool,
+
     /// The size that the window should assume when going floating.
     ///
     /// This is generally the last size the window had when it was floating. It can be unknown if
@@ -255,6 +262,7 @@ impl<W: LayoutElement> Tile<W> {
             sizing_mode,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
             restore_to_floating: false,
+            unfullscreen_to_maximized: false,
             floating_window_size: None,
             floating_pos: None,
             floating_preset_width_idx: None,

@@ -448,6 +448,14 @@ struct InteractiveMoveData<W: LayoutElement> {
     pub(self) width: ColumnWidth,
     /// Whether the window column was full-width.
     pub(self) is_full_width: bool,
+    /// Whether the window was maximized to edges when the move started.
+    ///
+    /// The move unmaximizes the window while it is dragged; dropping it maximizes it again.
+    pub(self) was_maximized: bool,
+    /// Whether the window was fullscreen when the move started.
+    ///
+    /// The move unfullscreens the window while it is dragged; dropping it restores fullscreen.
+    pub(self) was_fullscreen: bool,
     /// Whether the window targets the floating layout.
     pub(self) is_floating: bool,
     /// Pointer location within the visual window geometry as ratio from geometry size.
@@ -4200,6 +4208,8 @@ impl<W: LayoutElement> Layout<W> {
                     .workspaces_mut()
                     .find(|ws| ws.has_window(&window_id))
                     .unwrap();
+                // Remember the state to restore it on drop.
+                let (was_maximized, was_fullscreen) = ws.pending_maximized_and_fullscreen(window);
                 ws.set_fullscreen(window, false);
                 ws.set_maximized(window, false);
 
@@ -4248,6 +4258,8 @@ impl<W: LayoutElement> Layout<W> {
                     pointer_pos_within_output,
                     width,
                     is_full_width,
+                    was_maximized,
+                    was_fullscreen,
                     is_floating,
                     pointer_ratio_within_window,
                     output_config,
@@ -4457,6 +4469,10 @@ impl<W: LayoutElement> Layout<W> {
 
                 let win_id = move_.tile.window().id().clone();
                 let tile_render_loc = move_.tile_render_location(zoom);
+                // Dropped into another column, the window takes that column's state; anywhere
+                // else, it gets back the maximize and fullscreen it had before the move.
+                let restore_sizing = !matches!(position, InsertPosition::InColumn(..));
+                let (was_maximized, was_fullscreen) = (move_.was_maximized, move_.was_fullscreen);
 
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon
@@ -4552,6 +4568,15 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
+                if restore_sizing {
+                    let ws = mon
+                        .workspaces
+                        .iter_mut()
+                        .find(|ws| ws.has_window(&win_id))
+                        .unwrap();
+                    ws.restore_sizing_after_move(&win_id, was_maximized, was_fullscreen);
+                }
+
                 // needed because empty_workspace_above_first could have modified the idx
                 let (tile, tile_offset, ws_geo) = mon
                     .workspaces_with_render_geo_mut(false)
@@ -4575,6 +4600,7 @@ impl<W: LayoutElement> Layout<W> {
                 let ws = &mut workspaces[0];
 
                 // No point in trying to use the pointer position without outputs.
+                let win_id = move_.tile.window().id().clone();
                 ws.add_tile(
                     move_.tile,
                     WorkspaceAddWindowTarget::Auto,
@@ -4583,6 +4609,7 @@ impl<W: LayoutElement> Layout<W> {
                     move_.is_full_width,
                     move_.is_floating,
                 );
+                ws.restore_sizing_after_move(&win_id, move_.was_maximized, move_.was_fullscreen);
             }
         }
     }
