@@ -479,17 +479,15 @@ While it wobbles, a see-through window's blur shows the blurred backdrop, as wit
 The physics runs on the animation clock, so `slowdown` slows it and `off` turns it off.
 
 - `off`: no wobbling.
-- `friction`: how fast a wobble dies down (0.1 to 100; Compiz's default is 3).
+- `friction`: how fast a wobble dies down (0.1 to 100; default 5, Compiz's is 3).
 - `spring-k`: how stiff the springs are; loose springs swing slowly and far (0.1 to 100; Compiz's default is 8).
 - `move-effect`: also wobble, more gently, when a window moves without a drag (a move animation, such as a dropped window flying into its column). On by default; `move-effect false` turns it off. Columns that move as a whole do not wobble.
-- `open-shiver`: a window shivers as it opens (Compiz's map effect). Off by default.
 
 ```kdl
 animations {
     wobbly {
-        friction 3
+        friction 5
         spring-k 8
-        open-shiver
     }
 }
 ```

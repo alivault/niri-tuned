@@ -846,17 +846,6 @@ impl<W: LayoutElement> Tile<W> {
             0.,
             self.options.animations.window_open.anim,
         )));
-
-        if self
-            .wobbly_config()
-            .is_some_and(|config| config.open_shiver)
-        {
-            let size = self.tile_expected_or_current_size();
-            let size = DVec2::new(size.w.max(1.), size.h.max(1.));
-            let mut model = WobblyModel::new(self.clock.now());
-            model.shiver(size, fastrand::f64);
-            self.wobbly = Some(model);
-        }
     }
 
     pub fn resize_animation(&self) -> Option<&Animation> {
@@ -1832,7 +1821,8 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
-            // An opening window shivers inside its open animation.
+            // A window that wobbles while it opens (moved as it opens) bends inside its open
+            // animation.
             if wobbling {
                 if let Some((elem, _data)) =
                     self.render_wobbly(ctx.renderer, &elements, Point::new(0., 0.), 1.)

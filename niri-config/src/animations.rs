@@ -123,18 +123,15 @@ pub struct Wobbly {
     pub spring_k: f64,
     /// Also wobble when a window moves without a drag (a move animation).
     pub move_effect: bool,
-    /// Shiver when a window opens.
-    pub open_shiver: bool,
 }
 
 impl Default for Wobbly {
     fn default() -> Self {
         Self {
             off: false,
-            friction: 3.,
+            friction: 5.,
             spring_k: 8.,
             move_effect: true,
-            open_shiver: false,
         }
     }
 }
@@ -151,8 +148,6 @@ pub struct WobblyPart {
     pub spring_k: Option<FloatOrInt<0, 100>>,
     #[knuffel(child)]
     pub move_effect: Option<Flag>,
-    #[knuffel(child)]
-    pub open_shiver: Option<Flag>,
 }
 
 impl MergeWith<WobblyPart> for Wobbly {
@@ -161,7 +156,7 @@ impl MergeWith<WobblyPart> for Wobbly {
         if part.on {
             self.off = false;
         }
-        merge!((self, part), friction, spring_k, move_effect, open_shiver);
+        merge!((self, part), friction, spring_k, move_effect);
         // The physics needs some of each; 0 would never settle or never move.
         self.friction = self.friction.max(0.1);
         self.spring_k = self.spring_k.max(0.1);

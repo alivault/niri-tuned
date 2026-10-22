@@ -122,25 +122,6 @@ impl WobblyModel {
         self.wake();
     }
 
-    /// Compiz's map effect: the edges spring out from the middle, by `random()` (0 to 1) each.
-    pub fn shiver(&mut self, size: DVec2, mut random: impl FnMut() -> f64) {
-        if !self.anchored.contains(&true) {
-            for i in MIDDLE {
-                self.anchored[i] = true;
-            }
-        }
-        let center = size / 2.;
-        for i in 0..NODES {
-            if self.anchored[i] {
-                continue;
-            }
-            let rest = rest_position(i, size);
-            let dir = (rest + self.disp[i] - center) / size.max(DVec2::ONE);
-            self.vel[i] += dir * (random() * 7.5);
-        }
-        self.wake();
-    }
-
     /// Steps the physics up to `now`.
     pub fn advance(&mut self, now: Duration, friction: f64, spring_k: f64) {
         if self.resting || self.stale_clock {
@@ -415,20 +396,6 @@ mod tests {
         assert_eq!(model.displacement(2, 2), DVec2::ZERO);
         assert_eq!(model.displacement(0, 0), DVec2::new(-40., 0.));
         run(&mut model, 0, 5000, 8);
-        assert!(model.is_at_rest());
-    }
-
-    #[test]
-    fn shiver_moves_only_the_edges_and_settles() {
-        let mut model = WobblyModel::new(ms(0));
-        model.shiver(SIZE, || 1.);
-        model.advance(ms(0), FRICTION, SPRING_K);
-        run(&mut model, 0, 30, 8);
-        // The top-left corner springs out up and left.
-        let corner = model.displacement(0, 0);
-        assert!(corner.x < 0. && corner.y < 0., "{corner:?}");
-        assert_eq!(model.displacement(1, 1), DVec2::ZERO);
-        run(&mut model, 32, 5000, 8);
         assert!(model.is_at_rest());
     }
 }

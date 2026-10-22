@@ -999,7 +999,7 @@ mod tests {
         let defaults = do_parse("").animations.wobbly;
         assert_eq!(defaults, Wobbly::default());
         assert!(!defaults.off);
-        assert!(!defaults.open_shiver);
+        assert_eq!(defaults.friction, 5.);
 
         let wobbly = do_parse(
             r#"
@@ -1008,7 +1008,6 @@ mod tests {
                     friction 1.5
                     spring-k 4
                     move-effect false
-                    open-shiver
                 }
             }
         "#,
@@ -1019,11 +1018,10 @@ mod tests {
         assert_eq!(wobbly.friction, 1.5);
         assert_eq!(wobbly.spring_k, 4.);
         assert!(!wobbly.move_effect);
-        assert!(wobbly.open_shiver);
 
         // `off` turns it off and leaves the rest; a later part (an include) sets only what it
         // names.
-        let mut wobbly = do_parse("animations { wobbly { friction 5; }; }")
+        let mut wobbly = do_parse("animations { wobbly { friction 7; }; }")
             .animations
             .wobbly;
         wobbly.merge_with(&crate::animations::WobblyPart {
@@ -1031,7 +1029,7 @@ mod tests {
             ..Default::default()
         });
         assert!(wobbly.off);
-        assert_eq!(wobbly.friction, 5.);
+        assert_eq!(wobbly.friction, 7.);
         assert_eq!(wobbly.spring_k, Wobbly::default().spring_k);
 
         // 0 would never move or never settle.
@@ -2154,10 +2152,9 @@ mod tests {
                 ),
                 wobbly: Wobbly {
                     off: false,
-                    friction: 3.0,
+                    friction: 5.0,
                     spring_k: 8.0,
                     move_effect: true,
-                    open_shiver: false,
                 },
             },
             blur: Blur {
