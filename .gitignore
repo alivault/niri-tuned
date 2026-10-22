@@ -1,4 +1,5 @@
 /target
 /result
 
-.idea*.pending-snap
+.idea
+*.pending-snap
