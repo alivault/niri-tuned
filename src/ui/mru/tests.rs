@@ -395,7 +395,7 @@ fn scope_panel_is_a_segmented_control() {
         ..Default::default()
     };
     for scale in [1., 2.] {
-        let (mut surface, pills) =
+        let (surface, pills) =
             draw_panel(scale, &config, MruScope::Workspace, Some(MruScope::Output)).unwrap();
         assert_eq!(f64::from(surface.height()), 26. * scale);
         // Equal segments, back to back, 2px in from either edge.
