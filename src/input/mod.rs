@@ -51,6 +51,7 @@ use crate::layout::scrolling::ScrollDirection;
 use crate::layout::titlebar::TitlebarPart;
 use crate::layout::{ActivateWindow, HitType, LayoutElement as _};
 use crate::niri::{CastTarget, PointerVisibility, State};
+use crate::screen_zoom::{self, ScreenZoomPinch};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -2273,6 +2274,17 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
+            Action::SetScreenZoom(level) => {
+                if self.niri.config.borrow().screen_zoom.off {
+                    warn!("screen zoom is off in the config");
+                } else if let Some(output) = self
+                    .niri
+                    .output_under_cursor()
+                    .or_else(|| self.niri.layout.active_output().cloned())
+                {
+                    self.niri.set_screen_zoom(&output, level);
+                }
+            }
             Action::ToggleWindowUrgent(id) => {
                 let window = self
                     .niri
@@ -2991,8 +3003,8 @@ impl State {
                 // The press activates the window, which can scroll the view to it and move the
                 // button away from under a pointer that stayed put: that is still a click.
                 let delta = location - pressed_at;
-                let stayed = delta.x.abs() <= TITLEBAR_CLICK_SLOP
-                    && delta.y.abs() <= TITLEBAR_CLICK_SLOP;
+                let stayed =
+                    delta.x.abs() <= TITLEBAR_CLICK_SLOP && delta.y.abs() <= TITLEBAR_CLICK_SLOP;
                 if still_over || stayed {
                     self.titlebar_button_clicked(&window, part, alt);
                 }
@@ -4253,7 +4265,45 @@ impl State {
         );
     }
 
+    /// Starts a Mod + pinch zooming the screen under the pointer, if the modifier is down.
+    fn screen_zoom_pinch_begin(&mut self) -> bool {
+        self.niri.screen_zoom_pinch = None;
+
+        let config = self.niri.config.borrow();
+        let zoom = config.screen_zoom;
+        let mod_key = self.backend.mod_key(&config);
+        drop(config);
+        if zoom.off {
+            return false;
+        }
+
+        let mut wanted = zoom.modifiers;
+        if wanted.contains(Modifiers::COMPOSITOR) {
+            wanted.remove(Modifiers::COMPOSITOR);
+            wanted |= mod_key.to_modifiers();
+        }
+        let mods = modifiers_from_state(self.niri.seat.get_keyboard().unwrap().modifier_state());
+        if wanted.is_empty() || !mods.contains(wanted) {
+            return false;
+        }
+
+        let Some(output) = self.niri.output_under_cursor() else {
+            return false;
+        };
+        let start_level = self.niri.output_state[&output].screen_zoom.level;
+        self.niri.screen_zoom_pinch = Some(ScreenZoomPinch {
+            output,
+            start_level,
+        });
+        true
+    }
+
     fn on_gesture_pinch_begin<I: InputBackend>(&mut self, event: I::GesturePinchBeginEvent) {
+        // Mod + pinch zooms the screen, in the overview too.
+        if self.screen_zoom_pinch_begin() {
+            return;
+        }
+
         // While the overview is open, pinching zooms it in and out instead of going to clients.
         if self.niri.layout.overview_pinch_begin() {
             return;
@@ -4277,6 +4327,13 @@ impl State {
     }
 
     fn on_gesture_pinch_update<I: InputBackend>(&mut self, event: I::GesturePinchUpdateEvent) {
+        if let Some(pinch) = self.niri.screen_zoom_pinch.clone() {
+            let max = self.niri.config.borrow().screen_zoom.max_zoom;
+            let level = screen_zoom::pinch_level(pinch.start_level, event.scale(), max);
+            self.niri.set_screen_zoom(&pinch.output, level);
+            return;
+        }
+
         if let Some(redraw) = self.niri.layout.overview_pinch_update(event.scale()) {
             if redraw {
                 self.niri.queue_redraw_all();
@@ -4302,6 +4359,10 @@ impl State {
     }
 
     fn on_gesture_pinch_end<I: InputBackend>(&mut self, event: I::GesturePinchEndEvent) {
+        if self.niri.screen_zoom_pinch.take().is_some() {
+            return;
+        }
+
         if self.niri.layout.overview_pinch_end() {
             // Drive the rubber-band snap-back, if any.
             self.niri.queue_redraw_all();
@@ -4389,7 +4450,9 @@ impl State {
         &self,
         evt: &impl AbsolutePositionEvent<I>,
     ) -> Option<Point<f64, Logical>> {
-        self.compute_absolute_location(evt, self.niri.output_for_touch())
+        let pos = self.compute_absolute_location(evt, self.niri.output_for_touch())?;
+        // Touches land on the zoomed picture.
+        Some(self.niri.screen_zoom_to_content(pos))
     }
 
     fn on_touch_down<I: InputBackend>(&mut self, evt: I::TouchDownEvent) {

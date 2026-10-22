@@ -306,3 +306,82 @@ mod tests {
         );
     }
 }
+
+/// Whole-screen zoom (a screen magnifier), driven by the modifier held with a touchpad pinch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenZoom {
+    /// No screen zoom: pinches go to clients (or the overview) as before.
+    pub off: bool,
+    /// The highest zoom level.
+    pub max_zoom: f64,
+    /// The modifiers to hold down while pinching. `Modifiers::COMPOSITOR` is the Mod key.
+    pub modifiers: crate::binds::Modifiers,
+    /// The cursor grows with the zoom up to this scale.
+    pub max_cursor_scale: f64,
+}
+
+impl Default for ScreenZoom {
+    fn default() -> Self {
+        Self {
+            off: false,
+            max_zoom: 16.,
+            modifiers: crate::binds::Modifiers::COMPOSITOR,
+            max_cursor_scale: 3.,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+pub struct ScreenZoomPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub max_zoom: Option<FloatOrInt<1, 16>>,
+    #[knuffel(child, unwrap(argument, str))]
+    pub modifier: Option<ModifierSet>,
+    #[knuffel(child, unwrap(argument))]
+    pub max_cursor_scale: Option<FloatOrInt<1, 16>>,
+}
+
+impl MergeWith<ScreenZoomPart> for ScreenZoom {
+    fn merge_with(&mut self, part: &ScreenZoomPart) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+        merge!((self, part), max_zoom, max_cursor_scale);
+        if let Some(modifier) = part.modifier {
+            self.modifiers = modifier.0;
+        }
+    }
+}
+
+/// Modifier keys joined with `+`, as in a bind without its key: `"Mod"`, `"Ctrl+Alt"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModifierSet(pub crate::binds::Modifiers);
+
+impl std::str::FromStr for ModifierSet {
+    type Err = miette::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use crate::binds::Modifiers;
+
+        let mut modifiers = Modifiers::empty();
+        for part in s.split('+') {
+            let part = part.trim().to_ascii_lowercase();
+            modifiers |= match part.as_str() {
+                "mod" => Modifiers::COMPOSITOR,
+                "ctrl" | "control" => Modifiers::CTRL,
+                "shift" => Modifiers::SHIFT,
+                "alt" => Modifiers::ALT,
+                "super" | "win" => Modifiers::SUPER,
+                "iso_level3_shift" | "mod5" => Modifiers::ISO_LEVEL3_SHIFT,
+                "iso_level5_shift" | "mod3" => Modifiers::ISO_LEVEL5_SHIFT,
+                _ => return Err(miette::miette!("invalid modifier: {part:?}")),
+            };
+        }
+        Ok(Self(modifiers))
+    }
+}

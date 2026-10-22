@@ -42,4 +42,4 @@ If you're shipping niri and would like to make it work better for screen readers
 
 ## Desktop zoom
 
-There's no built-in zoom yet, but you can use third-party utilities like [wooz](https://github.com/negrel/wooz).
+Hold Mod and pinch on the touchpad to zoom the screen under the pointer (tuned build). See [`screen-zoom`](./Configuration:-Miscellaneous.md#screen-zoom-tuned-build) for the options.

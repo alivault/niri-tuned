@@ -87,6 +87,7 @@ pub struct Config {
     pub blur: Blur,
     pub gestures: Gestures,
     pub overview: Overview,
+    pub screen_zoom: ScreenZoom,
     pub environment: Environment,
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
@@ -205,6 +206,7 @@ where
                 "blur" => m_merge!(blur),
                 "gestures" => m_merge!(gestures),
                 "overview" => m_merge!(overview),
+                "screen-zoom" => m_merge!(screen_zoom),
                 "xwayland-satellite" => m_merge!(xwayland_satellite),
                 "switch-events" => m_merge!(switch_events),
                 "debug" => m_merge!(debug),
@@ -727,6 +729,38 @@ mod tests {
 
         assert!(Config::parse_mem("blur { radius -1; }").is_err());
         assert!(Config::parse_mem("blur { radius 2000; }").is_err());
+    }
+
+    #[test]
+    fn screen_zoom_parses_and_merges() {
+        let config = do_parse("");
+        assert_eq!(config.screen_zoom, ScreenZoom::default());
+        assert!(!config.screen_zoom.off);
+
+        let config = do_parse(
+            r#"screen-zoom { off; max-zoom 8; modifier "Mod+Shift"; max-cursor-scale 2; }"#,
+        );
+        let zoom = config.screen_zoom;
+        assert!(zoom.off);
+        assert_eq!(zoom.max_zoom, 8.);
+        assert_eq!(zoom.modifiers, Modifiers::COMPOSITOR | Modifiers::SHIFT);
+        assert_eq!(zoom.max_cursor_scale, 2.);
+
+        // `on` in a later layer turns it back on and keeps the rest.
+        let config = parse_layered("screen-zoom { off; max-zoom 4; }", "screen-zoom { on; }");
+        assert!(!config.screen_zoom.off);
+        assert_eq!(config.screen_zoom.max_zoom, 4.);
+
+        let config = do_parse(r#"screen-zoom { modifier "ctrl + alt"; }"#);
+        assert_eq!(
+            config.screen_zoom.modifiers,
+            Modifiers::CTRL | Modifiers::ALT
+        );
+
+        assert!(Config::parse_mem("screen-zoom { max-zoom 0.5; }").is_err());
+        assert!(Config::parse_mem("screen-zoom { max-zoom 17; }").is_err());
+        assert!(Config::parse_mem(r#"screen-zoom { modifier ""; }"#).is_err());
+        assert!(Config::parse_mem(r#"screen-zoom { modifier "Mod+Q"; }"#).is_err());
     }
 
     #[test]
@@ -2151,6 +2185,14 @@ mod tests {
                     },
                     inactive_border_opacity: 0.19,
                 },
+            },
+            screen_zoom: ScreenZoom {
+                off: false,
+                max_zoom: 16.0,
+                modifiers: Modifiers(
+                    COMPOSITOR,
+                ),
+                max_cursor_scale: 3.0,
             },
             environment: Environment(
                 [

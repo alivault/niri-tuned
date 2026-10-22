@@ -1054,6 +1054,14 @@ pub enum Action {
     OpenOverview {},
     /// Close the Overview.
     CloseOverview {},
+    /// Set the whole-screen zoom of the output under the pointer.
+    ///
+    /// 1 turns the zoom off. The level is clamped to `screen-zoom { max-zoom; }`.
+    SetScreenZoom {
+        /// Zoom level, from 1 to the configured maximum.
+        #[cfg_attr(feature = "clap", arg())]
+        level: f64,
+    },
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.

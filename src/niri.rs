@@ -155,6 +155,7 @@ use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::framebuffer_effect::FramebufferEffectElement;
+use crate::render_helpers::offscreen::OffscreenRenderElement;
 use crate::render_helpers::overview_blur::OverviewBlur;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -166,6 +167,7 @@ use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
     render_to_texture, render_to_vec, shaders, RenderCtx, RenderTarget,
 };
+use crate::screen_zoom::{self, OutputScreenZoom, ScreenZoomPinch};
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
 use crate::ui::config_error_notification::ConfigErrorNotification;
@@ -389,6 +391,8 @@ pub struct Niri {
     pub pointer_inside_hot_corner: bool,
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
+    /// The Mod + pinch zooming the screen, if any.
+    pub screen_zoom_pinch: Option<ScreenZoomPinch>,
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_wheel_tracker: ScrollTracker,
@@ -505,6 +509,8 @@ pub struct OutputState {
     screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// Whole-screen zoom.
+    pub screen_zoom: OutputScreenZoom,
 }
 
 #[derive(Debug, Default)]
@@ -1684,6 +1690,9 @@ impl State {
         // Release the borrow.
         drop(old_config);
 
+        // Turned off or a lower maximum: apply to the zoomed outputs.
+        self.niri.reclamp_screen_zoom();
+
         // Now with a &mut self we can reload the xkb config.
         if let Some(mut xkb) = reload_xkb {
             let mut set_xkb_config = true;
@@ -2661,6 +2670,7 @@ impl Niri {
             pointer_inside_hot_corner: false,
             tablet_cursor_location: None,
             gesture_swipe_3f_cumulative: None,
+            screen_zoom_pinch: None,
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
             vertical_wheel_tracker: ScrollTracker::new(120),
             horizontal_wheel_tracker: ScrollTracker::new(120),
@@ -2956,6 +2966,7 @@ impl Niri {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            screen_zoom: OutputScreenZoom::default(),
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -3786,6 +3797,16 @@ impl Niri {
 
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
+        // On a zoomed output the cursor grows around its hotspot.
+        let zoom_level = self.screen_zoom_level(output);
+        let cursor_zoom = if zoom_level > 1. {
+            let max = self.config.borrow().screen_zoom.max_cursor_scale;
+            screen_zoom::cursor_scale(zoom_level, max)
+        } else {
+            1.
+        };
+        let hotspot_pos: Point<i32, Physical> = pointer_pos.to_physical_precise_round(output_scale);
+
         match render_cursor {
             RenderCursor::Hidden => (),
             RenderCursor::Surface { surface, hotspot } => {
@@ -3799,7 +3820,15 @@ impl Niri {
                     output_scale,
                     1.,
                     Kind::Cursor,
-                    &mut |elem| push(elem.into()),
+                    &mut |elem| {
+                        if cursor_zoom > 1. {
+                            push(PointerRenderElements::ZoomedWayland(
+                                RescaleRenderElement::from_element(elem, hotspot_pos, cursor_zoom),
+                            ));
+                        } else {
+                            push(elem.into());
+                        }
+                    },
                 );
             }
             RenderCursor::Named {
@@ -3822,6 +3851,11 @@ impl Niri {
                     None,
                     Kind::Cursor,
                 ) {
+                    Ok(element) if cursor_zoom > 1. => {
+                        push(PointerRenderElements::ZoomedNamedPointer(
+                            RescaleRenderElement::from_element(element, hotspot_pos, cursor_zoom),
+                        ));
+                    }
                     Ok(element) => push(element.into()),
                     Err(err) => {
                         warn!("error importing a cursor texture: {err:?}");
@@ -4265,9 +4299,142 @@ impl Niri {
         let state = self.output_state.get(output).unwrap();
         ctx.xray = Some(&state.xray);
 
-        self.render_inner(ctx, output, include_pointer, push);
+        if self.screen_zoom_level(output) > 1. {
+            self.render_zoomed(ctx, output, include_pointer, push);
+        } else {
+            if ctx.target == RenderTarget::Output {
+                state.screen_zoom.offscreen_data.replace(None);
+            }
+            self.render_inner(ctx, output, include_pointer, push);
+        }
 
         self.clear_xray_elements(output);
+    }
+
+    /// Renders a zoomed output: the output as usual to an offscreen, then the part of it in
+    /// view stretched over the output, and the pointer on top where it is.
+    fn render_zoomed<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        output: &Output,
+        include_pointer: bool,
+        push: &mut dyn FnMut(OutputRenderElements<R>),
+    ) {
+        let _span = tracy_client::span!("Niri::render_zoomed");
+
+        let state = self.output_state.get(output).unwrap();
+        let zoom = &state.screen_zoom;
+        let level = zoom.level;
+        let output_scale = Scale::from(output.current_scale().fractional_scale());
+        let size = output_size(output);
+        let output_rect = Rectangle::from_size(size).to_physical_precise_round(output_scale);
+
+        // The pointer goes on the top, unzoomed: it is drawn over what it points at.
+        if include_pointer && self.pointer_visibility.is_visible() {
+            self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+        }
+
+        let mut elements = Vec::new();
+        self.render_inner(ctx.as_gles(), output, false, &mut |elem| {
+            if let Some(elem) = CropRenderElement::from_element(elem, output_scale, output_rect) {
+                elements.push(elem);
+            }
+        });
+
+        let buffer = &zoom.offscreen[ctx.target as usize];
+        let renderer = ctx.renderer.as_gles_renderer();
+        let elem = match buffer.render(renderer, output_scale, &elements) {
+            Ok((elem, _sync, data)) => {
+                if ctx.target == RenderTarget::Output {
+                    zoom.offscreen_data.replace(Some(data));
+                }
+                elem
+            }
+            Err(err) => {
+                warn!("error rendering the zoomed output: {err:?}");
+                if ctx.target == RenderTarget::Output {
+                    zoom.offscreen_data.replace(None);
+                }
+                self.render_inner(ctx, output, false, push);
+                return;
+            }
+        };
+
+        let origin = screen_zoom::view_origin(self.screen_zoom_focus(output), size, level);
+        let offset: Point<i32, Physical> = origin
+            .upscale(level)
+            .to_physical_precise_round(output_scale);
+        let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), level);
+        let elem =
+            RelocateRenderElement::from_element(elem, offset.upscale(-1), Relocate::Relative);
+        if let Some(elem) = CropRenderElement::from_element(elem, output_scale, output_rect) {
+            push(OutputRenderElements::ScreenZoom(elem));
+        }
+    }
+
+    /// The zoom level of an output; 1 when it isn't zoomed now.
+    pub fn screen_zoom_level(&self, output: &Output) -> f64 {
+        // The screenshot UI shows a (zoomed) screenshot as is, so that a selection there is
+        // what was on screen.
+        if self.screenshot_ui.is_open() {
+            return 1.;
+        }
+        self.output_state
+            .get(output)
+            .map_or(1., |state| state.screen_zoom.level)
+    }
+
+    /// The point the zoomed view of an output follows: the pointer, in output-local coordinates.
+    pub fn screen_zoom_focus(&self, output: &Output) -> Point<f64, Logical> {
+        let output_pos = self
+            .global_space
+            .output_geometry(output)
+            .map_or_else(Point::default, |geo| geo.loc);
+        let pointer_pos = self
+            .tablet_cursor_location
+            .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+        pointer_pos - output_pos.to_f64()
+    }
+
+    /// Maps a global position on the zoomed screen to the position it shows (for touch input,
+    /// which lands on the zoomed picture).
+    pub fn screen_zoom_to_content(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+        let Some((output, pos_within_output)) = self.output_under(pos) else {
+            return pos;
+        };
+        let level = self.screen_zoom_level(output);
+        if level <= 1. {
+            return pos;
+        }
+        let size = output_size(output);
+        let origin = screen_zoom::view_origin(self.screen_zoom_focus(output), size, level);
+        let content = screen_zoom::screen_to_content(pos_within_output, origin, level);
+        pos - pos_within_output + content
+    }
+
+    /// Sets the zoom level of an output, clamped to the configured range.
+    pub fn set_screen_zoom(&mut self, output: &Output, level: f64) {
+        let config = self.config.borrow().screen_zoom;
+        let level = if config.off {
+            1.
+        } else {
+            screen_zoom::clamp_level(level, config.max_zoom)
+        };
+        let Some(state) = self.output_state.get_mut(output) else {
+            return;
+        };
+        if state.screen_zoom.set_level(level) {
+            self.queue_redraw(output);
+        }
+    }
+
+    /// Applies the config to the zoom levels: off turns every zoom off; a lower maximum lowers
+    /// them.
+    pub fn reclamp_screen_zoom(&mut self) {
+        for output in self.output_state.keys().cloned().collect::<Vec<_>>() {
+            let level = self.output_state[&output].screen_zoom.level;
+            self.set_screen_zoom(&output, level);
+        }
     }
 
     fn render_inner<R: NiriRenderer>(
@@ -4850,6 +5017,22 @@ impl Niri {
         output: &Output,
         render_element_states: &RenderElementStates,
     ) {
+        // A zoomed output draws its surfaces into an offscreen: they are visible if it is.
+        let merged;
+        let render_element_states = match &*self.output_state[output]
+            .screen_zoom
+            .offscreen_data
+            .borrow()
+        {
+            Some(data) if render_element_states.element_was_presented(data.id.clone()) => {
+                let mut states = render_element_states.states.clone();
+                states.extend(data.states.states.iter().map(|(id, s)| (id.clone(), *s)));
+                merged = RenderElementStates { states };
+                &merged
+            }
+            _ => render_element_states,
+        };
+
         // FIXME: potentially tweak the compare function. The default one currently always prefers a
         // higher refresh-rate output, which is not always desirable (i.e. with a very small
         // overlap).
@@ -6694,6 +6877,8 @@ niri_render_elements! {
     PointerRenderElements<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
         NamedPointer = MemoryRenderBufferRenderElement<R>,
+        ZoomedWayland = RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
+        ZoomedNamedPointer = RescaleRenderElement<MemoryRenderBufferRenderElement<R>>,
     }
 }
 
@@ -6716,6 +6901,9 @@ niri_render_elements! {
             SolidColorRenderElement
         >>>,
         Pointer = PointerRenderElements<R>,
+        ScreenZoom = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+            OffscreenRenderElement
+        >>>,
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,

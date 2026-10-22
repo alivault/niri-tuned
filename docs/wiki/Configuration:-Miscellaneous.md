@@ -80,6 +80,13 @@ blur {
     noise 0.02
     saturation 1.5
 }
+
+screen-zoom {
+    // off
+    max-zoom 16
+    modifier "Mod"
+    max-cursor-scale 3
+}
 ```
 
 ### `spawn-at-startup`
@@ -533,4 +540,51 @@ Values above `1` increase saturation; values below `1` reduce it.
 blur {
     saturation 1.5
 }
+```
+
+### `screen-zoom` (tuned build)
+
+A whole-screen zoom (a screen magnifier, like macOS Accessibility Zoom).
+Hold the modifier and pinch on the touchpad: spread the fingers to zoom in, pinch them together to zoom out.
+The zoom follows the fingers directly, with no animation, and stays after you lift them.
+Pinch back to 1× to turn it off (levels below 1.02× snap to exactly 1×).
+
+Only the monitor under the pointer zooms, and each monitor keeps its own zoom level.
+The view follows the pointer continuously: the pointer's position on the monitor sets which part is in view, so a pointer at an edge of the monitor shows that edge.
+The point under the pointer stays where it is while you pinch.
+Clicks land on what is under the cursor, and the cursor grows with the zoom up to `max-cursor-scale`.
+Screenshots and screencasts show the zoomed picture, as you see it.
+
+Pinches without the modifier work as before: they go to the window under the pointer, or zoom the [Overview](./Overview.md) while it is open.
+With the modifier held, a pinch zooms the screen in the overview too.
+
+`off` turns the screen zoom off, and with it any zoom in effect; `on` turns it back on (for example, in a file that you [include](./Configuration:-Include.md) after one with `off`).
+
+`max-zoom` sets the highest zoom level, from 1 to 16 (16 by default).
+
+`modifier` sets the keys to hold while pinching, joined with `+` as in a key binding without its key: `"Mod"` (the default), `"Mod+Shift"`, `"Ctrl+Alt"`...
+Other keys may be held too.
+
+`max-cursor-scale` sets how big the cursor grows, from 1 (it keeps its size) to 16 (3 by default).
+
+```kdl
+// Zoom up to 8x with Super+Alt and a pinch; keep the cursor at its normal size.
+screen-zoom {
+    max-zoom 8
+    modifier "Super+Alt"
+    max-cursor-scale 1
+}
+```
+
+The `set-screen-zoom` action sets the zoom level of the monitor under the pointer, for example to bind keys to zoom levels, or from a script:
+
+```kdl
+binds {
+    Mod+Alt+Equal { set-screen-zoom 2.0; }
+    Mod+Alt+0 { set-screen-zoom 1.0; }
+}
+```
+
+```sh
+niri msg action set-screen-zoom 2.5
 ```
