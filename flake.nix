@@ -26,12 +26,14 @@
           lib,
           cairo,
           dbus,
+          gdk-pixbuf,
           libGL,
           libdisplay-info,
           libinput,
           seatd,
           libxkbcommon,
           libgbm,
+          librsvg,
           pango,
           pipewire,
           pkg-config,
@@ -86,6 +88,7 @@
             [
               cairo
               dbus
+              gdk-pixbuf
               libGL
               libdisplay-info
               libinput
@@ -114,6 +117,8 @@
           # this is fine for our build, we just need to make sure it has a directory to write to.
           preCheck = ''
             export XDG_RUNTIME_DIR="$(mktemp -d)"
+            # The switcher's icon test decodes an SVG through gdk-pixbuf's librsvg loader.
+            export GDK_PIXBUF_MODULE_FILE="${librsvg.out}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
           '';
 
           checkFlags = [
