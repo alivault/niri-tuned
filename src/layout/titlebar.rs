@@ -203,7 +203,7 @@ impl Titlebar {
     /// The square slot of the `idx`th button from the bar's edge, relative to a bar of `size`.
     fn button_rect(&self, size: Size<f64, Logical>, idx: usize) -> Rectangle<f64, Logical> {
         let button = self.config.button_size;
-        let offset = self.config.button_edge_gap + button * idx as f64;
+        let offset = self.config.button_edge_gap + (button + self.config.button_gap) * idx as f64;
         let x = match self.config.buttons_position {
             TitlebarButtonsPosition::Left => offset,
             TitlebarButtonsPosition::Right => size.w - offset - button,
@@ -286,6 +286,7 @@ impl Titlebar {
             // transparent bar leaves the title to the app.
             let reserved = self.config.button_edge_gap
                 + self.config.button_size * self.config.buttons.len() as f64
+                + self.config.button_gap * self.config.buttons.len().saturating_sub(1) as f64
                 + self.config.title_gap;
             let max_width = self.size.w - reserved * 2.;
             let max_width_px = (max_width * scale).floor() as i32;
@@ -962,6 +963,43 @@ mod tests {
                 "{x1} {y1} {x2} {y2}"
             );
             assert!(x2 - x1 > 100. && y2 - y1 > 100.);
+        }
+    }
+
+    #[test]
+    fn button_gap_spaces_the_slots() {
+        let size = Size::from((300., 30.));
+        for position in [
+            TitlebarButtonsPosition::Left,
+            TitlebarButtonsPosition::Right,
+        ] {
+            let bar = Titlebar::new(niri_config::Titlebar {
+                button_size: 24.,
+                button_edge_gap: 3.,
+                button_gap: 10.,
+                buttons_position: position,
+                ..Default::default()
+            });
+            let (first, second) = (bar.button_rect(size, 0), bar.button_rect(size, 1));
+            // 10 px between the slots, which stay 24 px squares centred on the bar.
+            assert_eq!(first.size, Size::from((24., 24.)));
+            assert_eq!(first.loc.y, 3.);
+            let between = match position {
+                TitlebarButtonsPosition::Left => second.loc.x - (first.loc.x + 24.),
+                TitlebarButtonsPosition::Right => first.loc.x - (second.loc.x + 24.),
+            };
+            assert_eq!(between, 10.);
+            let edge = match position {
+                TitlebarButtonsPosition::Left => first.loc.x,
+                TitlebarButtonsPosition::Right => 300. - first.loc.x - 24.,
+            };
+            assert_eq!(edge, 3.);
+            // The gap is the bar's, not a button's.
+            let gap = match position {
+                TitlebarButtonsPosition::Left => Point::from((3. + 24. + 5., 15.)),
+                TitlebarButtonsPosition::Right => Point::from((300. - 3. - 24. - 5., 15.)),
+            };
+            assert_eq!(bar.hit(size, gap), Some(TitlebarPart::Bar));
         }
     }
 

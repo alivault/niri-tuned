@@ -562,6 +562,7 @@ layout {
         button-circle 22
         icon-size 15
         button-edge-gap 4
+        button-gap 0
         title-gap 8
         button-hover-brighten 0.14
         buttons-position "left"
@@ -586,7 +587,7 @@ Colours may be see-through (`"#1e1e1ee6"`): a window rule giving a translucent t
 Title bars are off by default.
 `height` is in logical pixels; the bar's top corners follow the window's [`geometry-corner-radius`](./Configuration:-Window-Rules.md#geometry-corner-radius), and the window's top corners become square under it.
 `font` is a Pango font description.
-Each button takes a `button-size` square, centred on the bar's height, with its `button-circle` and its `icon-size` icon in the middle; `button-edge-gap` separates the outermost button from the bar's edge and `title-gap` the title from the buttons.
+Each button takes a `button-size` square, centred on the bar's height, with its `button-circle` and its `icon-size` icon in the middle; `button-edge-gap` separates the outermost button from the bar's edge, `button-gap` adds space between two neighbouring slots (not part of either button: a click there is on the bar), and `title-gap` the title from the buttons.
 The buttons' colours: `button-color` (circles; `button-inactive-color` on unfocused windows, `button-hover-color` under the pointer, else lightened by `button-hover-brighten`), `button-icon-color`, `button-icon-inactive-color` and `button-icon-hover-color` (icons; unset, the title's colours), and close's red `close-hover-color` with its icon `button-hover-text-color`.
 `button-styles` gives each button (`close`, `maximize-column`, `zoom`, `float`, `maximize`, `fullscreen`) its own `color`, `inactive-color`, `hover-color`, `icon-color`, `icon-inactive-color` and `icon-hover-color`, over all of those.
 `close-red` is when close's circle is red: `"hover"`, `"focused"` (on the focused window) or `"always"`; `button-hover-brighten` is how much white hover lays over an always-shown circle.

@@ -1598,6 +1598,8 @@ pub struct Titlebar {
     pub icon_size: f64,
     /// Gap between the outermost button and the bar's edge.
     pub button_edge_gap: f64,
+    /// Extra space between two neighbouring buttons' slots.
+    pub button_gap: f64,
     /// Gap between the title and the buttons.
     pub title_gap: f64,
     /// How much hover brightens an always-shown circle (white over it, 0 to 1).
@@ -1652,6 +1654,7 @@ impl Default for Titlebar {
             button_circle: 22.,
             icon_size: 15.,
             button_edge_gap: 4.,
+            button_gap: 0.,
             title_gap: 8.,
             button_hover_brighten: 0.14,
             buttons_position: TitlebarButtonsPosition::Left,
@@ -1887,6 +1890,8 @@ pub struct TitlebarRule {
     #[knuffel(child, unwrap(argument))]
     pub button_edge_gap: Option<FloatOrInt<0, 256>>,
     #[knuffel(child, unwrap(argument))]
+    pub button_gap: Option<FloatOrInt<0, 256>>,
+    #[knuffel(child, unwrap(argument))]
     pub title_gap: Option<FloatOrInt<0, 256>>,
     #[knuffel(child, unwrap(argument))]
     pub button_hover_brighten: Option<FloatOrInt<0, 1>>,
@@ -1932,6 +1937,7 @@ impl MergeWith<TitlebarRule> for Titlebar {
             button_circle,
             icon_size,
             button_edge_gap,
+            button_gap,
             title_gap,
             button_hover_brighten,
         );
@@ -1996,6 +2002,7 @@ impl MergeWith<Self> for TitlebarRule {
             button_circle,
             icon_size,
             button_edge_gap,
+            button_gap,
             title_gap,
             button_hover_brighten,
             buttons_position,
