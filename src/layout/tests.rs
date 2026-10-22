@@ -4025,6 +4025,36 @@ fn expel_pending_left_from_fullscreen_tabbed_column() {
 }
 
 #[test]
+fn fractional_titlebar_height_keeps_the_tile_in_the_working_area() {
+    // A title bar of 128.5 logical pixels (128.42 rounded to physical at scale 2) left a
+    // half-pixel window height that rounded up: the tile went 0.5 past the working area.
+    let ops = [
+        Op::AddWindow {
+            params: TestWindowParams {
+                bbox: Rectangle::from_size(Size::from((1, 1))),
+                min_max_size: (Size::from((0, 0)), Size::from((0, 2))),
+                has_ssd: true,
+                ..TestWindowParams::new(1)
+            },
+        },
+        Op::AddScaledOutput {
+            id: 1,
+            scale: 2.,
+            layout_config: Some(Box::new(niri_config::LayoutPart {
+                titlebar: Some(niri_config::TitlebarRule {
+                    on: true,
+                    height: Some(FloatOrInt(128.41917436855962)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        },
+    ];
+
+    check_ops(ops);
+}
+
+#[test]
 fn workspace_render_geo_at_fractional_scale() {
     let ops = [
         Op::AddScaledOutput {

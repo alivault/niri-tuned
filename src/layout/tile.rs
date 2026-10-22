@@ -222,6 +222,14 @@ pub(super) struct AlphaAnimation {
     offscreen: OffscreenBuffer,
 }
 
+/// The title bar height in whole logical pixels, then rounded to physical pixels.
+///
+/// A window gets a whole number of logical pixels: a half-pixel title bar (128.42 at scale 2
+/// is 128.5) would round the window up and push the tile past its column's height.
+fn titlebar_height_in_physical(scale: f64, height: f64) -> f64 {
+    round_logical_in_physical(scale, height.round())
+}
+
 impl<W: LayoutElement> Tile<W> {
     pub fn new(
         window: W,
@@ -235,7 +243,7 @@ impl<W: LayoutElement> Tile<W> {
         let focus_ring_config = options.layout.focus_ring.merged_with(&rules.focus_ring);
         let shadow_config = options.layout.shadow.merged_with(&rules.shadow);
         let mut titlebar_config = options.layout.titlebar.clone().merged_with(&rules.titlebar);
-        titlebar_config.height = round_logical_in_physical(scale, titlebar_config.height);
+        titlebar_config.height = titlebar_height_in_physical(scale, titlebar_config.height);
         let sizing_mode = window.sizing_mode();
 
         Self {
@@ -309,7 +317,7 @@ impl<W: LayoutElement> Tile<W> {
             .titlebar
             .clone()
             .merged_with(&rules.titlebar);
-        titlebar_config.height = round_logical_in_physical(self.scale, titlebar_config.height);
+        titlebar_config.height = titlebar_height_in_physical(self.scale, titlebar_config.height);
         self.titlebar.update_config(titlebar_config);
 
         self.window.update_config(self.options.blur);
@@ -475,7 +483,7 @@ impl<W: LayoutElement> Tile<W> {
             .titlebar
             .clone()
             .merged_with(&rules.titlebar);
-        titlebar_config.height = round_logical_in_physical(self.scale, titlebar_config.height);
+        titlebar_config.height = titlebar_height_in_physical(self.scale, titlebar_config.height);
         self.titlebar.update_config(titlebar_config);
 
         let window_size = self.window_size();
