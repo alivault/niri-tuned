@@ -425,13 +425,14 @@ fn render_button(
 
     let colors = button_colors(config, button, hovered, icon_hovered, is_active);
     if let Some(fill) = colors.circle {
+        let side = config.button_circle * scale;
+        let radius = button_corner_radius(config) * scale;
         set_color(&cr, fill);
-        let radius = config.button_circle * scale / 2.;
-        cr.arc(c, c, radius, 0., 2. * PI);
+        button_shape(&cr, c, side, radius);
         cr.fill()?;
         if colors.brighten {
             cr.set_source_rgba(1., 1., 1., config.button_hover_brighten);
-            cr.arc(c, c, radius, 0., 2. * PI);
+            button_shape(&cr, c, side, radius);
             cr.fill()?;
         }
     }
@@ -450,6 +451,26 @@ fn render_button(
     drop(cr);
 
     upload(renderer, surface, scale)
+}
+
+/// A button shape's corner radius: `button-radius`, at most half its side; unset, a circle.
+fn button_corner_radius(config: &niri_config::Titlebar) -> f64 {
+    let half = config.button_circle.max(0.) / 2.;
+    config.button_radius.map_or(half, |r| r.clamp(0., half))
+}
+
+/// A button's shape as the current path: a `side` square centred on (`c`, `c`), its corners
+/// rounded at `radius` (a circle at half the side).
+fn button_shape(cr: &cairo::Context, c: f64, side: f64, radius: f64) {
+    let half = side / 2.;
+    let r = radius.clamp(0., half);
+    let (x0, y0, x1, y1) = (c - half, c - half, c + half, c + half);
+    cr.new_sub_path();
+    cr.arc(x1 - r, y0 + r, r, -PI / 2., 0.);
+    cr.arc(x1 - r, y1 - r, r, 0., PI / 2.);
+    cr.arc(x0 + r, y1 - r, r, PI / 2., PI);
+    cr.arc(x0 + r, y0 + r, r, PI, 3. * PI / 2.);
+    cr.close_path();
 }
 
 /// A button's colours in a state.
@@ -938,6 +959,46 @@ fn svg_arc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_radius_rounds_the_square() {
+        let config = |radius| niri_config::Titlebar {
+            button_circle: 18.,
+            button_radius: radius,
+            ..Default::default()
+        };
+        // Unset: a circle, as before.
+        assert_eq!(button_corner_radius(&config(None)), 9.);
+        assert_eq!(button_corner_radius(&config(Some(5.))), 5.);
+        assert_eq!(button_corner_radius(&config(Some(0.))), 0.);
+        // Never more than half the side.
+        assert_eq!(button_corner_radius(&config(Some(20.))), 9.);
+    }
+
+    #[test]
+    fn button_shape_is_a_rounded_square() {
+        // A 20 px square with 5 px corners, centred on a 30 px slot.
+        let alpha = |radius: f64, x: i32, y: i32| {
+            let mut surface = ImageSurface::create(cairo::Format::ARgb32, 30, 30).unwrap();
+            let cr = cairo::Context::new(&surface).unwrap();
+            cr.set_source_rgba(1., 1., 1., 1.);
+            button_shape(&cr, 15., 20., radius);
+            cr.fill().unwrap();
+            drop(cr);
+            let stride = surface.stride() as usize;
+            let data = surface.data().unwrap();
+            data[y as usize * stride + x as usize * 4 + 3]
+        };
+        // The edges' middles are filled, outside the square is not.
+        assert_eq!(alpha(5., 5, 15), 255);
+        assert_eq!(alpha(5., 15, 5), 255);
+        assert_eq!(alpha(5., 4, 15), 0);
+        // The corner pixel is cut away by the radius, kept when square.
+        assert_eq!(alpha(5., 5, 5), 0);
+        assert_eq!(alpha(0., 5, 5), 255);
+        // Concentric: 1 px in along the corner's diagonal past the arc is filled.
+        assert_eq!(alpha(5., 7, 7), 255);
+    }
 
     #[test]
     fn every_icon_parses() {

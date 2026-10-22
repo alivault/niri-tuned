@@ -704,6 +704,27 @@ mod tests {
     }
 
     #[test]
+    fn titlebar_button_radius_parses_and_layers() {
+        let config = do_parse("layout {\n titlebar {\n button-circle 18\n }\n}");
+        assert_eq!(config.layout.titlebar.button_radius, None);
+        let config = do_parse("layout {\n titlebar {\n button-circle 18\n button-radius 5\n }\n}");
+        assert_eq!(config.layout.titlebar.button_radius, Some(5.));
+        // The user's radius over the defaults', and a window rule's over the layout's.
+        let config = parse_layered(
+            "layout {\n titlebar {\n button-radius 9\n }\n}",
+            "layout {\n titlebar {\n button-radius 2.5\n }\n}",
+        );
+        assert_eq!(config.layout.titlebar.button_radius, Some(2.5));
+        let config = parse_layered(
+            "layout {\n titlebar {\n button-radius 9\n }\n}",
+            "window-rule {\n titlebar {\n button-radius 3\n }\n}",
+        );
+        let mut bar = config.layout.titlebar.clone();
+        bar.merge_with(&config.window_rules[0].titlebar);
+        assert_eq!(bar.button_radius, Some(3.));
+    }
+
+    #[test]
     fn blur_radius_parses_and_the_strength_set_last_wins() {
         let config = do_parse("blur { noise 0.05; }");
         assert_eq!(config.blur.radius, None);
@@ -1843,6 +1864,7 @@ mod tests {
                     close_red: Hover,
                     button_size: 30.0,
                     button_circle: 22.0,
+                    button_radius: None,
                     icon_size: 15.0,
                     button_edge_gap: 4.0,
                     button_gap: 0.0,
@@ -2438,6 +2460,7 @@ mod tests {
                         close_red: None,
                         button_size: None,
                         button_circle: None,
+                        button_radius: None,
                         icon_size: None,
                         button_edge_gap: None,
                         button_gap: None,
