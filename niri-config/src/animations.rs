@@ -1,7 +1,7 @@
 use knuffel::errors::DecodeError;
 use knuffel::Decode as _;
 
-use crate::utils::{expect_only_children, parse_arg_node, MergeWith};
+use crate::utils::{expect_only_children, parse_arg_node, Flag, MergeWith};
 use crate::FloatOrInt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +20,7 @@ pub struct Animations {
     pub overview_open_close: OverviewOpenCloseAnim,
     pub recent_windows_close: RecentWindowsCloseAnim,
     pub blur_fade: BlurFadeAnim,
+    pub wobbly: Wobbly,
 }
 
 impl Default for Animations {
@@ -39,6 +40,7 @@ impl Default for Animations {
             overview_open_close: Default::default(),
             recent_windows_close: Default::default(),
             blur_fade: Default::default(),
+            wobbly: Default::default(),
         }
     }
 }
@@ -75,6 +77,8 @@ pub struct AnimationsPart {
     pub recent_windows_close: Option<RecentWindowsCloseAnim>,
     #[knuffel(child)]
     pub blur_fade: Option<BlurFadeAnim>,
+    #[knuffel(child)]
+    pub wobbly: Option<WobblyPart>,
 }
 
 impl MergeWith<AnimationsPart> for Animations {
@@ -103,6 +107,64 @@ impl MergeWith<AnimationsPart> for Animations {
             recent_windows_close,
             blur_fade,
         );
+
+        // Field by field: Settings writes one node at a time, over the defaults.
+        merge!((self, part), wobbly);
+    }
+}
+
+/// Compiz-style wobbly windows: a spring-mass grid that bends a window while it moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wobbly {
+    pub off: bool,
+    /// How fast the wobble dies down (Compiz's `friction`).
+    pub friction: f64,
+    /// How stiff the springs between the grid's points are (Compiz's `spring_k`).
+    pub spring_k: f64,
+    /// Also wobble when a window moves without a drag (a move animation).
+    pub move_effect: bool,
+    /// Shiver when a window opens.
+    pub open_shiver: bool,
+}
+
+impl Default for Wobbly {
+    fn default() -> Self {
+        Self {
+            off: false,
+            friction: 3.,
+            spring_k: 8.,
+            move_effect: true,
+            open_shiver: false,
+        }
+    }
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+pub struct WobblyPart {
+    #[knuffel(child)]
+    pub off: bool,
+    #[knuffel(child)]
+    pub on: bool,
+    #[knuffel(child, unwrap(argument))]
+    pub friction: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child, unwrap(argument))]
+    pub spring_k: Option<FloatOrInt<0, 100>>,
+    #[knuffel(child)]
+    pub move_effect: Option<Flag>,
+    #[knuffel(child)]
+    pub open_shiver: Option<Flag>,
+}
+
+impl MergeWith<WobblyPart> for Wobbly {
+    fn merge_with(&mut self, part: &WobblyPart) {
+        self.off |= part.off;
+        if part.on {
+            self.off = false;
+        }
+        merge!((self, part), friction, spring_k, move_effect, open_shiver);
+        // The physics needs some of each; 0 would never settle or never move.
+        self.friction = self.friction.max(0.1);
+        self.spring_k = self.spring_k.max(0.1);
     }
 }
 

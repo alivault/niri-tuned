@@ -467,6 +467,32 @@ animations {
 }
 ```
 
+#### `wobbly`
+
+<sup>Since: niri-tuned</sup>
+
+Compiz-style wobbly windows, on by default.
+A window is a 4 × 4 grid of masses on springs (Compiz's model).
+While you drag a window, the point you hold follows the pointer and the rest of the window lags behind and swings back; when you let go, it settles.
+The window's border, focus ring, shadow, title bar and rounded corners bend with it.
+The physics runs on the animation clock, so `slowdown` slows it and `off` turns it off.
+
+- `off`: no wobbling.
+- `friction`: how fast a wobble dies down (0.1 to 100; Compiz's default is 3).
+- `spring-k`: how stiff the springs are; loose springs swing slowly and far (0.1 to 100; Compiz's default is 8).
+- `move-effect`: also wobble, more gently, when a window moves without a drag (a move animation, such as a dropped window flying into its column). On by default; `move-effect false` turns it off. Columns that move as a whole do not wobble.
+- `open-shiver`: a window shivers as it opens (Compiz's map effect). Off by default.
+
+```kdl
+animations {
+    wobbly {
+        friction 3
+        spring-k 8
+        open-shiver
+    }
+}
+```
+
 ### Synchronized Animations
 
 <sup>Since: 0.1.5</sup>

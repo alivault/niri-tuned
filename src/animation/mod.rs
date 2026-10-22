@@ -10,6 +10,7 @@ mod spring;
 pub use spring::{Spring, SpringParams};
 
 mod clock;
+pub mod wobbly;
 pub use clock::Clock;
 
 #[derive(Debug, Clone)]

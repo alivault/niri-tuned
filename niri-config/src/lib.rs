@@ -993,6 +993,59 @@ mod tests {
     }
 
     #[test]
+    fn wobbly_windows() {
+        use crate::animations::Wobbly;
+
+        let defaults = do_parse("").animations.wobbly;
+        assert_eq!(defaults, Wobbly::default());
+        assert!(!defaults.off);
+        assert!(!defaults.open_shiver);
+
+        let wobbly = do_parse(
+            r#"
+            animations {
+                wobbly {
+                    friction 1.5
+                    spring-k 4
+                    move-effect false
+                    open-shiver
+                }
+            }
+        "#,
+        )
+        .animations
+        .wobbly;
+        assert!(!wobbly.off);
+        assert_eq!(wobbly.friction, 1.5);
+        assert_eq!(wobbly.spring_k, 4.);
+        assert!(!wobbly.move_effect);
+        assert!(wobbly.open_shiver);
+
+        // `off` turns it off and leaves the rest; a later part (an include) sets only what it
+        // names.
+        let mut wobbly = do_parse("animations { wobbly { friction 5; }; }")
+            .animations
+            .wobbly;
+        wobbly.merge_with(&crate::animations::WobblyPart {
+            off: true,
+            ..Default::default()
+        });
+        assert!(wobbly.off);
+        assert_eq!(wobbly.friction, 5.);
+        assert_eq!(wobbly.spring_k, Wobbly::default().spring_k);
+
+        // 0 would never move or never settle.
+        let wobbly = do_parse("animations { wobbly { friction 0; spring-k 0; }; }")
+            .animations
+            .wobbly;
+        assert_eq!((wobbly.friction, wobbly.spring_k), (0.1, 0.1));
+
+        assert!(Config::parse_mem("animations { wobbly { friction -1; }; }").is_err());
+        assert!(Config::parse_mem("animations { wobbly { spring-k 101; }; }").is_err());
+        assert!(Config::parse_mem("animations { wobbly { bounce 1; }; }").is_err());
+    }
+
+    #[test]
     fn parse() {
         let parsed = do_parse(
             r##"
@@ -2099,6 +2152,13 @@ mod tests {
                         ),
                     },
                 ),
+                wobbly: Wobbly {
+                    off: false,
+                    friction: 3.0,
+                    spring_k: 8.0,
+                    move_effect: true,
+                    open_shiver: false,
+                },
             },
             blur: Blur {
                 off: false,

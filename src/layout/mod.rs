@@ -4082,6 +4082,15 @@ impl<W: LayoutElement> Layout<W> {
             f64::clamp(pointer_offset_within_window.y / window_size.h, 0., 1.),
         );
 
+        // Wobbly windows: the pointer holds the window where it grabbed it.
+        if let Some(tile) = self
+            .workspaces_mut()
+            .find(|ws| ws.has_window(&window_id))
+            .and_then(|ws| ws.tiles_mut().find(|tile| *tile.window().id() == window_id))
+        {
+            tile.wobbly_grab(pointer_ratio_within_window);
+        }
+
         self.interactive_move = Some(InteractiveMoveState::Starting {
             window_id,
             pointer_delta: Point::from((0., 0.)),
@@ -4221,7 +4230,7 @@ impl<W: LayoutElement> Layout<W> {
                 } = self.remove_window(window, Transaction::new()).unwrap();
 
                 tile.stop_move_animations();
-                tile.interactive_move_offset = Point::from((0., 0.));
+                tile.reset_interactive_move_offset();
                 tile.window().output_enter(&output);
                 tile.window().set_preferred_scale_transform(
                     output.current_scale(),
@@ -4297,6 +4306,7 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
+                let same_output = output == move_.output;
                 if output != move_.output {
                     move_.tile.window().output_leave(&move_.output);
                     move_.tile.window().output_enter(&output);
@@ -4324,6 +4334,15 @@ impl<W: LayoutElement> Layout<W> {
                     move_.tile.update_config(view_size, scale, Rc::new(options));
                 }
 
+                if same_output {
+                    // The tile follows the pointer: wobbly windows lag behind it. (Across
+                    // outputs the positions don't compare.)
+                    let zoom = self
+                        .monitor_for_output(&output)
+                        .map_or(1., |mon| mon.overview_zoom());
+                    let delta = pointer_pos_within_output - move_.pointer_pos_within_output;
+                    move_.tile.wobbly_drag(delta.downscale(zoom));
+                }
                 move_.pointer_pos_within_output = pointer_pos_within_output;
 
                 self.interactive_move = Some(InteractiveMoveState::Moving(move_));
@@ -4357,9 +4376,9 @@ impl<W: LayoutElement> Layout<W> {
                 for ws in self.workspaces_mut() {
                     if let Some(tile) = ws.tiles_mut().find(|tile| *tile.window().id() == window_id)
                     {
-                        let offset = tile.interactive_move_offset;
-                        tile.interactive_move_offset = Point::from((0., 0.));
+                        let offset = tile.reset_interactive_move_offset();
                         tile.animate_move_from(offset);
+                        tile.wobbly_release();
                     }
 
                     // Unlock the view on the workspaces, but if the moved window was active,
@@ -4386,6 +4405,7 @@ impl<W: LayoutElement> Layout<W> {
         let Some(InteractiveMoveState::Moving(mut move_)) = self.interactive_move.take() else {
             unreachable!()
         };
+        move_.tile.wobbly_release();
 
         for mon in self.monitors_mut() {
             mon.dnd_scroll_gesture_end();

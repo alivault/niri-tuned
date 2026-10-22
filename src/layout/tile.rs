@@ -1,11 +1,15 @@
 use core::f64;
+use std::cell::Cell;
 use std::rc::Rc;
+
+use glam::DVec2;
 
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
-use smithay::backend::renderer::element::{Element, Kind};
+use smithay::backend::renderer::element::{Element, Id, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
@@ -16,6 +20,7 @@ use super::{
     HitType, LayoutElement, LayoutElementRenderElement, LayoutElementRenderSnapshot, Options,
     SizeFrac, RESIZE_ANIMATION_THRESHOLD,
 };
+use crate::animation::wobbly::WobblyModel;
 use crate::animation::{Animation, Clock};
 use crate::layout::SizingMode;
 use crate::niri_render_elements;
@@ -23,12 +28,13 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
-use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
+use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+use crate::render_helpers::wobbly::WobblyRenderElement;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -153,6 +159,18 @@ pub struct Tile<W: LayoutElement> {
     /// Offset during the initial interactive move rubberband.
     pub(super) interactive_move_offset: Point<f64, Logical>,
 
+    /// Wobbly windows: the spring model, while the tile wobbles or is grabbed.
+    wobbly: Option<WobblyModel>,
+    /// The render offset the model has followed so far.
+    ///
+    /// Its changes are the tile's own moves on screen. A new move animation changes the render
+    /// offset without moving the tile (it starts where the tile was), so it moves this too.
+    wobbly_offset: Point<f64, Logical>,
+    /// The tile drawn offscreen, to bend.
+    wobbly_offscreen: OffscreenBuffer,
+    wobbly_id: Id,
+    wobbly_commit: Cell<CommitCounter>,
+
     /// Snapshot of the last render for use in the close animation.
     unmap_snapshot: Option<TileRenderSnapshot>,
 
@@ -188,6 +206,7 @@ niri_render_elements! {
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
+        Wobbly = WobblyRenderElement,
     }
 }
 
@@ -228,6 +247,9 @@ pub(super) struct AlphaAnimation {
     pub(super) hold_after_done: bool,
     offscreen: OffscreenBuffer,
 }
+
+/// How much of a move animation (not a drag) wobbles a window.
+const WOBBLY_MOVE_GAIN: f64 = 0.35;
 
 /// The title bar height in whole logical pixels, then rounded to physical pixels.
 ///
@@ -273,6 +295,11 @@ impl<W: LayoutElement> Tile<W> {
             move_y_animation: None,
             alpha_animation: None,
             interactive_move_offset: Point::from((0., 0.)),
+            wobbly: None,
+            wobbly_offset: Point::from((0., 0.)),
+            wobbly_offscreen: OffscreenBuffer::default(),
+            wobbly_id: Id::new(),
+            wobbly_commit: Cell::new(CommitCounter::default()),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
             view_size,
@@ -535,10 +562,144 @@ impl<W: LayoutElement> Tile<W> {
                 self.alpha_animation = None;
             }
         }
+
+        self.advance_wobbly();
+    }
+
+    /// The wobbly windows settings, or None when they are off (animations off too).
+    fn wobbly_config(&self) -> Option<niri_config::animations::Wobbly> {
+        let animations = &self.options.animations;
+        let config = animations.wobbly;
+        let off = config.off || animations.off || self.clock.should_complete_instantly();
+        (!off).then_some(config)
+    }
+
+    fn advance_wobbly(&mut self) {
+        let offset = self.render_offset();
+        let delta = offset - self.wobbly_offset;
+        self.wobbly_offset = offset;
+
+        let Some(config) = self.wobbly_config() else {
+            self.wobbly = None;
+            return;
+        };
+
+        if delta != Point::from((0., 0.)) {
+            if self.wobbly.is_none() && config.move_effect {
+                self.wobbly = Some(WobblyModel::new(self.clock.now()));
+            }
+            if let Some(model) = &mut self.wobbly {
+                // Niri's move animations are fast: at full strength the corners would trail far
+                // behind. A held window follows its pointer at full strength.
+                let gain = if model.is_grabbed() {
+                    1.
+                } else {
+                    WOBBLY_MOVE_GAIN
+                };
+                model.translate(DVec2::new(delta.x, delta.y) * gain);
+            }
+        }
+
+        if let Some(model) = &mut self.wobbly {
+            model.advance(self.clock.now(), config.friction, config.spring_k);
+            if model.is_at_rest() && !model.is_grabbed() {
+                self.wobbly = None;
+            }
+        }
+    }
+
+    /// A render offset change that is not a move on screen (a new move animation starts where
+    /// the tile was).
+    fn rebase_wobbly_offset(&mut self, before: Point<f64, Logical>) {
+        self.wobbly_offset += self.render_offset() - before;
+    }
+
+    /// The pointer grabs the tile to move it, at `ratio` of the window's size.
+    pub fn wobbly_grab(&mut self, ratio: (f64, f64)) {
+        if self.wobbly_config().is_none() {
+            return;
+        }
+        let window = Point::<f64, Logical>::from((
+            self.window_loc().x + self.window_size().w * ratio.0,
+            self.window_loc().y + self.window_size().h * ratio.1,
+        ));
+        let size = self.animated_tile_size();
+        let size = DVec2::new(size.w.max(1.), size.h.max(1.));
+        let at = DVec2::new(window.x, window.y) / size;
+        let now = self.clock.now();
+        self.wobbly
+            .get_or_insert_with(|| WobblyModel::new(now))
+            .grab(at, size);
+    }
+
+    /// The grabbing pointer moved the tile by `delta` (in the tile's own logical pixels).
+    pub fn wobbly_drag(&mut self, delta: Point<f64, Logical>) {
+        if let Some(model) = &mut self.wobbly {
+            model.translate(DVec2::new(delta.x, delta.y));
+        }
+    }
+
+    /// The pointer let go of the tile: it settles, still held where it was grabbed.
+    pub fn wobbly_release(&mut self) {
+        if let Some(model) = &mut self.wobbly {
+            model.release();
+        }
+    }
+
+    /// Whether the tile is drawn bent this frame.
+    fn is_wobbling(&self) -> bool {
+        self.wobbly
+            .as_ref()
+            .is_some_and(|model| !model.is_at_rest())
+            && self.fullscreen_progress() == 0.
+    }
+
+    fn render_wobbly(
+        &self,
+        renderer: &mut GlesRenderer,
+        elements: &[TileRenderElement<GlesRenderer>],
+        location: Point<f64, Logical>,
+        alpha: f32,
+    ) -> Option<(WobblyRenderElement, OffscreenData)> {
+        let model = self.wobbly.as_ref()?;
+        if !WobblyRenderElement::has_shader(renderer) {
+            return None;
+        }
+        let scale = Scale::from(self.scale);
+        let (picture, _sync, mut data) = self
+            .wobbly_offscreen
+            .render(renderer, scale, elements)
+            .map_err(|err| warn!("error rendering tile to offscreen for wobbly: {err:?}"))
+            .ok()?;
+
+        let mut commit = self.wobbly_commit.get();
+        commit.increment();
+        self.wobbly_commit.set(commit);
+
+        let size = self.animated_tile_size();
+        let points = model.control_points(DVec2::new(size.w, size.h));
+        let elem = WobblyRenderElement::new(
+            renderer,
+            self.wobbly_id.clone(),
+            commit,
+            &picture,
+            scale,
+            location,
+            size,
+            &points,
+            alpha,
+        )?;
+        data.id = elem.id().clone();
+        Some((elem, data))
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        self.are_transitions_ongoing() || self.window.rules().baba_is_float == Some(true)
+        self.are_transitions_ongoing()
+            || self.window.rules().baba_is_float == Some(true)
+            || self
+                .wobbly
+                .as_ref()
+                .is_some_and(|model| !model.is_at_rest())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -685,6 +846,17 @@ impl<W: LayoutElement> Tile<W> {
             0.,
             self.options.animations.window_open.anim,
         )));
+
+        if self
+            .wobbly_config()
+            .is_some_and(|config| config.open_shiver)
+        {
+            let size = self.tile_expected_or_current_size();
+            let size = DVec2::new(size.w.max(1.), size.h.max(1.));
+            let mut model = WobblyModel::new(self.clock.now());
+            model.shiver(size, fastrand::f64);
+            self.wobbly = Some(model);
+        }
     }
 
     pub fn resize_animation(&self) -> Option<&Animation> {
@@ -701,7 +873,8 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn animate_move_x_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
-        let current_offset = self.render_offset().x;
+        let before = self.render_offset();
+        let current_offset = before.x;
 
         // Preserve the previous config if ongoing.
         let anim = self.move_x_animation.take().map(|move_| move_.anim);
@@ -713,6 +886,7 @@ impl<W: LayoutElement> Tile<W> {
             anim,
             from: from + current_offset,
         });
+        self.rebase_wobbly_offset(before);
     }
 
     pub fn animate_move_y_from(&mut self, from: f64) {
@@ -720,7 +894,8 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn animate_move_y_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
-        let current_offset = self.render_offset().y;
+        let before = self.render_offset();
+        let current_offset = before.y;
 
         // Preserve the previous config if ongoing.
         let anim = self.move_y_animation.take().map(|move_| move_.anim);
@@ -732,9 +907,11 @@ impl<W: LayoutElement> Tile<W> {
             anim,
             from: from + current_offset,
         });
+        self.rebase_wobbly_offset(before);
     }
 
     pub fn offset_move_y_anim_current(&mut self, offset: f64) {
+        let before = self.render_offset();
         if let Some(move_) = self.move_y_animation.as_mut() {
             // If the anim is almost done, there's little point trying to offset it; we can let
             // things jump. If it turns out like a bad idea, we could restart the anim instead.
@@ -743,11 +920,22 @@ impl<W: LayoutElement> Tile<W> {
                 move_.from += offset / value;
             }
         }
+        self.rebase_wobbly_offset(before);
     }
 
     pub fn stop_move_animations(&mut self) {
+        let before = self.render_offset();
         self.move_x_animation = None;
         self.move_y_animation = None;
+        self.rebase_wobbly_offset(before);
+    }
+
+    /// Ends the rubberband of an interactive move where the layout takes over the tile's place.
+    pub fn reset_interactive_move_offset(&mut self) -> Point<f64, Logical> {
+        let before = self.render_offset();
+        let offset = std::mem::take(&mut self.interactive_move_offset);
+        self.rebase_wobbly_offset(before);
+        offset
     }
 
     pub fn animate_alpha(&mut self, from: f64, to: f64, config: niri_config::Animation) {
@@ -1635,6 +1823,14 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
+            // An opening window shivers inside its open animation.
+            if self.is_wobbling() {
+                if let Some((elem, _data)) =
+                    self.render_wobbly(ctx.renderer, &elements, Point::new(0., 0.), 1.)
+                {
+                    elements = vec![elem.into()];
+                }
+            }
             match open.render(
                 ctx.renderer,
                 &elements,
@@ -1652,7 +1848,27 @@ impl<W: LayoutElement> Tile<W> {
                     warn!("error rendering window opening animation: {err:?}");
                 }
             }
-        } else if let Some(alpha) = &self.alpha_animation {
+        } else if self.is_wobbling() {
+            // Bent, with the alpha animation's alpha if there is one (an interactive move).
+            let mut ctx = ctx.as_gles();
+            let mut elements = Vec::new();
+            self.render_inner(
+                ctx.r(),
+                Point::new(0., 0.),
+                xray_pos,
+                focus_ring,
+                &mut |elem| elements.push(elem),
+            );
+            if let Some((elem, data)) =
+                self.render_wobbly(ctx.renderer, &elements, location, tile_alpha)
+            {
+                self.window().set_offscreen_data(Some(data));
+                push(elem.into());
+                pushed = true;
+            }
+        }
+
+        if let Some(alpha) = self.alpha_animation.as_ref().filter(|_| !pushed) {
             let mut ctx = ctx.as_gles();
             let mut elements = Vec::new();
             self.render_inner(
