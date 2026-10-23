@@ -2584,6 +2584,64 @@ fn interactive_move_onto_empty_output() {
 }
 
 #[test]
+fn interactive_move_fades_content_not_background_effect() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::InteractiveMoveBegin {
+            window: 1,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+        Op::InteractiveMoveUpdate {
+            window: 1,
+            dx: 1000.,
+            dy: 0.,
+            output_idx: 1,
+            px: 0.,
+            py: 0.,
+        },
+        Op::AdvanceAnimations { msec_delta: 1000 },
+    ]);
+
+    // Held see-through while dragged; its blur stays at full strength.
+    let Some(InteractiveMoveState::Moving(move_)) = &layout.interactive_move else {
+        panic!("the move should have started");
+    };
+    let alpha = move_.tile.alpha_animation.as_ref().unwrap();
+    assert!(alpha.content_only);
+    assert_eq!(alpha.anim.clamped_value(), INTERACTIVE_MOVE_ALPHA);
+    assert_eq!(move_.tile.background_effect_alpha(), 1.);
+
+    // Dropped: the content fades back, the blur does not jump.
+    check_ops_on_layout(&mut layout, [Op::InteractiveMoveEnd { window: 1 }]);
+    let ws = layout.active_workspace().unwrap();
+    let tile = ws.tiles().find(|tile| *tile.window().id() == 1).unwrap();
+    assert!(tile.alpha_animation.as_ref().unwrap().content_only);
+    assert_eq!(tile.background_effect_alpha(), 1.);
+
+    // A tile that really fades (a tab going to the background) fades its blur too.
+    let mut tile_layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+    ]);
+    let config = tile_layout.options.animations.window_movement.0;
+    let ws = tile_layout.active_workspace_mut().unwrap();
+    let tile = ws.tiles_mut().next().unwrap();
+    tile.animate_alpha(0.5, 0., config);
+    assert!(!tile.alpha_animation.as_ref().unwrap().content_only);
+    assert_eq!(tile.background_effect_alpha(), 0.5);
+}
+
+#[test]
 fn interactive_move_onto_empty_output_ewaf() {
     let ops = [
         Op::AddOutput(1),

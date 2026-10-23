@@ -250,6 +250,9 @@ pub(super) struct AlphaAnimation {
     /// semitransparent, then hold it at semitransparent for a while, until the operation
     /// completes.
     pub(super) hold_after_done: bool,
+    /// Whether only the window content fades, its background effect staying at full strength
+    /// (an interactive move: the dragged window is see-through, its blur is not).
+    pub(super) content_only: bool,
     offscreen: OffscreenBuffer,
 }
 
@@ -684,6 +687,15 @@ impl<W: LayoutElement> Tile<W> {
         }
     }
 
+    /// The alpha of the tile's background effect: the tile's alpha, unless only its content
+    /// fades (an interactive move, and the fade back after the drop).
+    pub(super) fn background_effect_alpha(&self) -> f32 {
+        match &self.alpha_animation {
+            Some(alpha) if !alpha.content_only => alpha.anim.clamped_value() as f32,
+            _ => 1.,
+        }
+    }
+
     /// Whether the tile is drawn bent this frame.
     fn is_wobbling(&self) -> bool {
         self.wobbly
@@ -701,6 +713,7 @@ impl<W: LayoutElement> Tile<W> {
         elements: &[TileRenderElement<GlesRenderer>],
         location: Point<f64, Logical>,
         alpha: f32,
+        backdrop_alpha: f32,
         backdrop: Option<WobblyBackdrop<'_>>,
     ) -> Option<(
         WobblyRenderElement,
@@ -739,7 +752,13 @@ impl<W: LayoutElement> Tile<W> {
 
         let backdrop = backdrop.and_then(|backdrop| {
             self.render_wobbly_backdrop(
-                renderer, backdrop, &picture, location, size, &points, alpha,
+                renderer,
+                backdrop,
+                &picture,
+                location,
+                size,
+                &points,
+                backdrop_alpha,
             )
         });
 
@@ -1036,6 +1055,22 @@ impl<W: LayoutElement> Tile<W> {
     }
 
     pub fn animate_alpha(&mut self, from: f64, to: f64, config: niri_config::Animation) {
+        self.start_alpha_animation(from, to, config, false);
+    }
+
+    /// Like [`Self::animate_alpha`], but the background effect stays at full strength: only the
+    /// content fades.
+    pub fn animate_content_alpha(&mut self, from: f64, to: f64, config: niri_config::Animation) {
+        self.start_alpha_animation(from, to, config, true);
+    }
+
+    fn start_alpha_animation(
+        &mut self,
+        from: f64,
+        to: f64,
+        config: niri_config::Animation,
+        content_only: bool,
+    ) {
         let from = from.clamp(0., 1.);
         let to = to.clamp(0., 1.);
 
@@ -1048,6 +1083,7 @@ impl<W: LayoutElement> Tile<W> {
         self.alpha_animation = Some(AlphaAnimation {
             anim: Animation::new(self.clock.clone(), current, to, 0., config),
             hold_after_done: false,
+            content_only,
             offscreen,
         });
     }
@@ -1906,6 +1942,7 @@ impl<W: LayoutElement> Tile<W> {
             .alpha_animation
             .as_ref()
             .map_or(1., |alpha| alpha.anim.clamped_value()) as f32;
+        let effect_alpha = self.background_effect_alpha();
 
         let mut pushed = false;
         self.window().set_offscreen_data(None);
@@ -1933,7 +1970,7 @@ impl<W: LayoutElement> Tile<W> {
             // animation.
             if wobbling {
                 if let Some((elem, _, _data)) =
-                    self.render_wobbly(ctx.renderer, &elements, Point::new(0., 0.), 1., None)
+                    self.render_wobbly(ctx.renderer, &elements, Point::new(0., 0.), 1., 1., None)
                 {
                     elements = vec![elem.into()];
                 }
@@ -1988,9 +2025,14 @@ impl<W: LayoutElement> Tile<W> {
                 target: ctx.target,
                 xray_pos,
             });
-            if let Some((elem, backdrop, data)) =
-                self.render_wobbly(ctx.renderer, &elements, location, tile_alpha, backdrop)
-            {
+            if let Some((elem, backdrop, data)) = self.render_wobbly(
+                ctx.renderer,
+                &elements,
+                location,
+                tile_alpha,
+                effect_alpha,
+                backdrop,
+            ) {
                 self.window().set_offscreen_data(Some(data));
                 push(elem.into());
                 if let Some(backdrop) = backdrop {
@@ -2013,7 +2055,8 @@ impl<W: LayoutElement> Tile<W> {
             // A live (non-xray) background effect reads what is below it in the framebuffer it
             // is drawn to; in the offscreen nothing is, and the window shows clear (a tile held
             // in an interactive move, at INTERACTIVE_MOVE_ALPHA). So it is drawn on screen,
-            // under the offscreen, at the tile's place.
+            // under the offscreen, at the tile's place, at full strength unless the whole tile
+            // fades (not during an interactive move: only the content is see-through).
             let (effects, elements) = take_live_effects(elements);
             match alpha.offscreen.render(ctx.renderer, scale, &elements) {
                 Ok((elem, _sync, data)) => {
@@ -2023,7 +2066,7 @@ impl<W: LayoutElement> Tile<W> {
                     self.window().set_offscreen_data(Some(data));
                     push(elem.into());
                     for effect in effects {
-                        let effect = effect.translated(location).faded(tile_alpha);
+                        let effect = effect.translated(location).faded(effect_alpha);
                         push(TileRenderElement::BackgroundEffect(effect.into()));
                     }
                     pushed = true;

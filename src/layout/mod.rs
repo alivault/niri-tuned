@@ -3403,7 +3403,7 @@ impl<W: LayoutElement> Layout<W> {
                     win.request_size_once(size, true);
 
                     // Animate the tile back to opaque.
-                    move_.tile.animate_alpha(
+                    move_.tile.animate_content_alpha(
                         INTERACTIVE_MOVE_ALPHA,
                         1.,
                         self.options.animations.window_movement.0,
@@ -3415,7 +3415,7 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 } else {
                     // Animate the tile back to semitransparent.
-                    move_.tile.animate_alpha(
+                    move_.tile.animate_content_alpha(
                         1.,
                         INTERACTIVE_MOVE_ALPHA,
                         self.options.animations.window_movement.0,
@@ -4253,7 +4253,7 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 } else {
                     // Animate to semitransparent.
-                    tile.animate_alpha(
+                    tile.animate_content_alpha(
                         1.,
                         INTERACTIVE_MOVE_ALPHA,
                         self.options.animations.window_movement.0,
@@ -4418,7 +4418,7 @@ impl<W: LayoutElement> Layout<W> {
             }
 
             // Also animate the tile back to opaque.
-            move_.tile.animate_alpha(
+            move_.tile.animate_content_alpha(
                 INTERACTIVE_MOVE_ALPHA,
                 1.,
                 self.options.animations.window_movement.0,
