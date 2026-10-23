@@ -194,6 +194,23 @@ binds {
 
 ALNIAC's GlobalShortcuts portal backend writes such binds for the keys apps get through the portal.
 
+#### `send-key-to-app`
+
+<sup>niri-tuned</sup>
+
+Sends the bind's key, down and then up, to the first window of an app id instead of the focused window, like Hyprland's `pass`.
+This is for apps with their own hotkeys but no support for global shortcuts.
+
+```kdl
+binds {
+    Ctrl+Alt+M repeat=false { send-key-to-app "com.obsproject.Studio"; }
+}
+```
+
+Keyboard focus moves to that window for each key event and comes back at once, so the app sees a focus change.
+It doesn't work for an app that ignores keys while it isn't the active window, or that takes the focus change as the key's release.
+Xwayland apps (through xwayland-satellite) may not get the key.
+
 ### Actions
 
 Every action that you can bind is also available for programmatic invocation via `niri msg action`.

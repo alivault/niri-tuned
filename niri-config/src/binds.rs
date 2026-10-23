@@ -110,6 +110,10 @@ pub enum Action {
     /// `Key name="..." { noop; }`: does nothing; a named bind whose press and release only go
     /// to the IPC event stream (`NamedBindChanged`).
     Noop,
+    /// `Key { send-key-to-app "app-id"; }`: the key, down and then up, goes to the first window
+    /// of that app id instead of the focused one; for apps with their own hotkeys but no global
+    /// shortcuts.
+    SendKeyToApp(#[knuffel(argument)] String),
     Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
     #[knuffel(skip)]
     ChangeVt(i32),

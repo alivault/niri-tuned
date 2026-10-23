@@ -402,10 +402,16 @@ impl State {
 
         if pressed {
             self.hide_cursor_if_needed();
-        } else if let Some(name) = self.niri.named_binds_down.remove(&event.key_code()) {
-            // The key that pressed a named bind came up. Its release is still suppressed below,
-            // as for every bind.
-            self.ipc_named_bind(name, false);
+        } else {
+            if let Some(name) = self.niri.named_binds_down.remove(&event.key_code()) {
+                // The key that pressed a named bind came up. Its release is still suppressed
+                // below, as for every bind.
+                self.ipc_named_bind(name, false);
+            }
+            if let Some(app_id) = self.niri.sent_keys_down.remove(&event.key_code()) {
+                // The key sent to an app came up: its release goes there too.
+                self.send_key_to_app(&app_id, event.key_code(), KeyState::Released, serial, time);
+            }
         }
 
         let is_inhibiting_shortcuts = self.is_inhibiting_shortcuts();
@@ -581,9 +587,52 @@ impl State {
             }
         }
 
+        if let Action::SendKeyToApp(app_id) = &bind.action {
+            let key_code = event.key_code();
+            if !self.niri.is_locked() && !self.niri.sent_keys_down.contains_key(&key_code) {
+                if self.send_key_to_app(app_id, key_code, KeyState::Pressed, serial, time) {
+                    self.niri.sent_keys_down.insert(key_code, app_id.clone());
+                }
+            }
+            return;
+        }
+
         self.handle_bind(bind.clone());
 
         self.start_key_repeat(bind);
+    }
+
+    /// Sends one key event to the first window of `app_id` (in the layout's order), focused or
+    /// not: keyboard focus moves to it for the event and comes back, as Hyprland's `pass` does.
+    /// The window sees the modifiers held now. Whether the app acts on a key while it isn't the
+    /// active window is up to the app. Returns whether a window got it.
+    fn send_key_to_app(
+        &mut self,
+        app_id: &str,
+        key_code: Keycode,
+        key_state: KeyState,
+        serial: smithay::utils::Serial,
+        time: u32,
+    ) -> bool {
+        let target = self.niri.layout.windows().find_map(|(_, mapped)| {
+            let id = crate::utils::with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone());
+            (id.as_deref() == Some(app_id)).then(|| mapped.toplevel().wl_surface().clone())
+        });
+        let Some(target) = target else {
+            debug!("send-key-to-app: no window of {app_id}");
+            return false;
+        };
+
+        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        let previous = keyboard.current_focus();
+        if previous.as_ref() != Some(&target) {
+            keyboard.set_focus(self, Some(target.clone()), serial);
+        }
+        keyboard.input_forward(self, key_code, key_state, SERIAL_COUNTER.next_serial(), time, false);
+        if previous.as_ref() != Some(&target) {
+            keyboard.set_focus(self, previous, SERIAL_COUNTER.next_serial());
+        }
+        true
     }
 
     /// Releases every named bind held down: the key releases may never come (a VT switch,
@@ -697,6 +746,8 @@ impl State {
             Action::Unbind => (),
             // A named bind's press and release go to the IPC event stream (on_keyboard).
             Action::Noop => (),
+            // Sent with its key's press and release in on_keyboard.
+            Action::SendKeyToApp(_) => (),
             Action::Quit(skip_confirmation) => {
                 if !skip_confirmation && self.niri.exit_confirm_dialog.show() {
                     self.niri.queue_redraw_all();
