@@ -402,6 +402,10 @@ impl State {
 
         if pressed {
             self.hide_cursor_if_needed();
+        } else if let Some(name) = self.niri.named_binds_down.remove(&event.key_code()) {
+            // The key that pressed a named bind came up. Its release is still suppressed below,
+            // as for every bind.
+            self.ipc_named_bind(name, false);
         }
 
         let is_inhibiting_shortcuts = self.is_inhibiting_shortcuts();
@@ -566,9 +570,28 @@ impl State {
             return;
         }
 
+        if let Some(name) = &bind.name {
+            if !self.niri.is_locked() || bind.allow_when_locked {
+                let key_code = event.key_code();
+                // A second press of the key without its release (another keyboard): one press.
+                if !self.niri.named_binds_down.contains_key(&key_code) {
+                    self.niri.named_binds_down.insert(key_code, name.clone());
+                    self.ipc_named_bind(name.clone(), true);
+                }
+            }
+        }
+
         self.handle_bind(bind.clone());
 
         self.start_key_repeat(bind);
+    }
+
+    /// Releases every named bind held down: the key releases may never come (a VT switch,
+    /// suspend).
+    pub fn release_named_binds(&mut self) {
+        for (_, name) in std::mem::take(&mut self.niri.named_binds_down) {
+            self.ipc_named_bind(name, false);
+        }
     }
 
     fn start_key_repeat(&mut self, bind: Bind) {
@@ -672,6 +695,8 @@ impl State {
         match action {
             // Removed with the binding it replaces when the config merges; never bound.
             Action::Unbind => (),
+            // A named bind's press and release go to the IPC event stream (on_keyboard).
+            Action::Noop => (),
             Action::Quit(skip_confirmation) => {
                 if !skip_confirmation && self.niri.exit_confirm_dialog.show() {
                     self.niri.queue_redraw_all();
@@ -685,11 +710,13 @@ impl State {
                 self.backend.change_vt(vt);
                 // Changing VT may not deliver the key releases, so clear the state.
                 self.niri.suppressed_keys.clear();
+                self.release_named_binds();
             }
             Action::Suspend => {
                 self.backend.suspend();
                 // Suspend may not deliver the key releases, so clear the state.
                 self.niri.suppressed_keys.clear();
+                self.release_named_binds();
             }
             Action::PowerOffMonitors => {
                 self.niri.deactivate_monitors(&mut self.backend);
@@ -3443,6 +3470,7 @@ impl State {
                                 allow_when_locked: false,
                                 allow_inhibiting: false,
                                 hotkey_overlay_title: None,
+                                name: None,
                             });
                             let bind_right = Some(Bind {
                                 key: Key {
@@ -3455,6 +3483,7 @@ impl State {
                                 allow_when_locked: false,
                                 allow_inhibiting: false,
                                 hotkey_overlay_title: None,
+                                name: None,
                             });
                             (bind_left, bind_right)
                         } else {
@@ -3504,6 +3533,7 @@ impl State {
                             allow_when_locked: false,
                             allow_inhibiting: false,
                             hotkey_overlay_title: None,
+                            name: None,
                         });
                         let bind_down = Some(Bind {
                             key: Key {
@@ -3516,6 +3546,7 @@ impl State {
                             allow_when_locked: false,
                             allow_inhibiting: false,
                             hotkey_overlay_title: None,
+                            name: None,
                         });
                         (bind_up, bind_down)
                     } else if should_handle_in_overview && modifiers == Modifiers::SHIFT {
@@ -3530,6 +3561,7 @@ impl State {
                             allow_when_locked: false,
                             allow_inhibiting: false,
                             hotkey_overlay_title: None,
+                            name: None,
                         });
                         let bind_down = Some(Bind {
                             key: Key {
@@ -3542,6 +3574,7 @@ impl State {
                             allow_when_locked: false,
                             allow_inhibiting: false,
                             hotkey_overlay_title: None,
+                            name: None,
                         });
                         (bind_up, bind_down)
                     } else {
@@ -4772,6 +4805,7 @@ fn should_intercept_key<'a>(
                     // inhibited.
                     allow_inhibiting: false,
                     hotkey_overlay_title: None,
+                    name: None,
                 });
             }
         }
@@ -4838,6 +4872,7 @@ fn find_bind<'a>(
             // Hardcoded binds must never be inhibited.
             allow_inhibiting: false,
             hotkey_overlay_title: None,
+            name: None,
         });
     }
 
@@ -5082,6 +5117,7 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
         allow_when_locked: false,
         allow_inhibiting: false,
         hotkey_overlay_title: None,
+        name: None,
     })
 }
 
@@ -5503,6 +5539,7 @@ mod tests {
             allow_when_locked: false,
             allow_inhibiting: true,
             hotkey_overlay_title: None,
+            name: None,
         }]);
 
         let comp_mod = ModKey::Super;
@@ -5689,6 +5726,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                name: None,
             },
             Bind {
                 key: Key {
@@ -5701,6 +5739,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                name: None,
             },
             Bind {
                 key: Key {
@@ -5713,6 +5752,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                name: None,
             },
             Bind {
                 key: Key {
@@ -5725,6 +5765,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                name: None,
             },
             Bind {
                 key: Key {
@@ -5737,6 +5778,7 @@ mod tests {
                 allow_when_locked: false,
                 allow_inhibiting: true,
                 hotkey_overlay_title: None,
+                name: None,
             },
         ]);
 

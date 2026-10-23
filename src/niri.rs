@@ -333,6 +333,9 @@ pub struct Niri {
     pub seat: Seat<State>,
     /// Scancodes of the keys to suppress.
     pub suppressed_keys: HashSet<Keycode>,
+    /// Keys held down that pressed a bind with a `name`: their release is sent on the IPC event
+    /// stream (`NamedBindChanged`).
+    pub named_binds_down: HashMap<Keycode, String>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
     /// Title bar button pressed with the left mouse button, whether Alt was held, and the
@@ -2635,6 +2638,7 @@ impl Niri {
             popups: PopupManager::default(),
             popup_grab: None,
             suppressed_keys: HashSet::new(),
+            named_binds_down: HashMap::new(),
             suppressed_buttons: HashSet::new(),
             titlebar_press: None,
             titlebar_menu_view: None,

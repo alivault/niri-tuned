@@ -1853,6 +1853,17 @@ pub enum Event {
         /// Stream ID of the stopped screencast.
         stream_id: u64,
     },
+    /// A bind with a `name` was pressed or released.
+    ///
+    /// Sent only for keyboard binds that set `name="..."`: once when the key goes down (the
+    /// bind's action runs then, as always) and once when that key comes up. A process can
+    /// follow a key held down this way (push-to-talk) without running anything per press.
+    NamedBindChanged {
+        /// The bind's `name`.
+        name: String,
+        /// Whether the key is now down.
+        pressed: bool,
+    },
 }
 
 impl From<Duration> for Timestamp {

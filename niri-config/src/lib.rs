@@ -2638,6 +2638,7 @@ mod tests {
                                 "Inhibit",
                             ),
                         ),
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2654,6 +2655,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2674,6 +2676,7 @@ mod tests {
                         allow_when_locked: true,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2692,6 +2695,7 @@ mod tests {
                         hotkey_overlay_title: Some(
                             None,
                         ),
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2708,6 +2712,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2726,6 +2731,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2742,6 +2748,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2760,6 +2767,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2778,6 +2786,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2794,6 +2803,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2814,6 +2824,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2834,6 +2845,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2852,6 +2864,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2868,6 +2881,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -2886,6 +2900,7 @@ mod tests {
                         allow_when_locked: true,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                 ],
             ),
@@ -3104,6 +3119,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3126,6 +3142,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3150,6 +3167,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: true,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                 ],
                 opened_binds: [
@@ -3168,6 +3186,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3184,6 +3203,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3200,6 +3220,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3218,6 +3239,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3236,6 +3258,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3254,6 +3277,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3270,6 +3294,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3286,6 +3311,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3302,6 +3328,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3322,6 +3349,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3342,6 +3370,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3362,6 +3391,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                     Bind {
                         key: Key {
@@ -3382,6 +3412,7 @@ mod tests {
                         allow_when_locked: false,
                         allow_inhibiting: false,
                         hotkey_overlay_title: None,
+                        name: None,
                     },
                 ],
             },

@@ -706,6 +706,15 @@ impl State {
         server.send_event(event);
     }
 
+    /// A named bind went down or up (`Bind::name`): an event for the event stream, not kept in
+    /// its state (a new client gets no old presses).
+    pub fn ipc_named_bind(&mut self, name: String, pressed: bool) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+        server.send_event(Event::NamedBindChanged { name, pressed });
+    }
+
     pub fn ipc_refresh_keyboard_layout_index(&mut self) {
         let keyboard = self.niri.seat.get_keyboard().unwrap();
         let idx = keyboard.with_xkb_state(self, |context| {

@@ -178,6 +178,22 @@ binds {
 
 ![Custom markup example.](https://github.com/user-attachments/assets/2a2ba914-bfa7-4dfa-bb5e-49839034765d)
 
+### Named Binds
+
+<sup>niri-tuned</sup>
+
+A keyboard bind with a `name` property reports its key going down and coming up on the IPC event stream, as a `NamedBindChanged { name, pressed }` event.
+The bind's action runs on the press as always; `noop` is an action that does nothing, for a bind that is only reported.
+A process that follows the event stream (`niri msg --json event-stream`) can then act while a key is held, such as push-to-talk, without a process for each press.
+
+```kdl
+binds {
+    Ctrl+Alt+P name="push-to-talk" repeat=false { noop; }
+}
+```
+
+ALNIAC's GlobalShortcuts portal backend writes such binds for the keys apps get through the portal.
+
 ### Actions
 
 Every action that you can bind is also available for programmatic invocation via `niri msg action`.

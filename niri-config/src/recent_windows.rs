@@ -686,6 +686,7 @@ impl From<MruBind> for Bind {
             allow_when_locked: false,
             allow_inhibiting: x.allow_inhibiting,
             hotkey_overlay_title: x.hotkey_overlay_title,
+            name: None,
         }
     }
 }
@@ -1002,6 +1003,7 @@ impl From<MruOpenedBind> for Bind {
             allow_when_locked: false,
             allow_inhibiting: false,
             hotkey_overlay_title: None,
+            name: None,
         }
     }
 }

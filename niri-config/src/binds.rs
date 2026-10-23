@@ -28,6 +28,9 @@ pub struct Bind {
     pub allow_when_locked: bool,
     pub allow_inhibiting: bool,
     pub hotkey_overlay_title: Option<Option<String>>,
+    /// `name="..."`: the bind's press and release are sent on the IPC event stream
+    /// (`NamedBindChanged`). Keyboard binds only.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -104,6 +107,9 @@ pub enum Action {
     /// file), so the key goes to the focused window again. Never stored: the binds merge
     /// removes it with the binding it replaces.
     Unbind,
+    /// `Key name="..." { noop; }`: does nothing; a named bind whose press and release only go
+    /// to the IPC event stream (`NamedBindChanged`).
+    Noop,
     Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
     #[knuffel(skip)]
     ChangeVt(i32),
@@ -852,6 +858,7 @@ where
         let mut allow_when_locked_node = None;
         let mut allow_inhibiting = true;
         let mut hotkey_overlay_title = None;
+        let mut bind_name = None;
         for (name, val) in &node.properties {
             match &***name {
                 "repeat" => {
@@ -871,6 +878,16 @@ where
                 }
                 "hotkey-overlay-title" => {
                     hotkey_overlay_title = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
+                }
+                "name" => {
+                    if !matches!(key.trigger, Trigger::Keysym(_)) {
+                        ctx.emit_error(DecodeError::unexpected(
+                            name,
+                            "property",
+                            "name can only be set on keyboard binds",
+                        ));
+                    }
+                    bind_name = Some(knuffel::traits::DecodeScalar::decode(val, ctx)?);
                 }
                 name_str => {
                     ctx.emit_error(DecodeError::unexpected(
@@ -895,6 +912,7 @@ where
             allow_when_locked: false,
             allow_inhibiting: true,
             hotkey_overlay_title: None,
+            name: None,
         };
 
         if let Some(child) = children.next() {
@@ -931,6 +949,7 @@ where
                         allow_when_locked,
                         allow_inhibiting,
                         hotkey_overlay_title,
+                        name: bind_name,
                     })
                 }
                 Err(e) => {
