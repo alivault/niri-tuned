@@ -11,7 +11,9 @@ use crate::handlers::background_effect::get_cached_blur_region;
 use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::damage::ExtraDamage;
-use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
+use crate::render_helpers::framebuffer_effect::{
+    FramebufferEffect, FramebufferEffectElement, MaskInfo,
+};
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::utils::region::TransformedRegion;
@@ -281,7 +283,16 @@ impl BackgroundEffect {
         };
         let saturation = self.options.saturation.unwrap_or(saturation) as f32;
 
-        if self.options.xray || (xray_pos.prefer_xray && ctx.xray.is_some()) {
+        if xray_pos.mask {
+            let info = MaskInfo {
+                xray: self.options.xray,
+                blur: blur_options,
+                noise,
+                saturation,
+            };
+            let elem = self.nonxray.render_mask(params, info).with_alpha(alpha);
+            push(elem.into());
+        } else if self.options.xray || (xray_pos.prefer_xray && ctx.xray.is_some()) {
             let Some(xray) = ctx.xray else {
                 return;
             };

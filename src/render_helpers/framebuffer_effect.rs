@@ -39,6 +39,20 @@ pub struct FramebufferEffectElement {
     noise: f32,
     saturation: f32,
     alpha: f32,
+    /// Drawn as its shape only (opaque white, faded by `alpha`), into a wobbly window's mask:
+    /// what the effect would have been.
+    mask: Option<MaskInfo>,
+}
+
+/// The effect a mask element stands for, for the wobbly window that draws it behind its mesh.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaskInfo {
+    /// Show the xray backdrop rather than what is below the window.
+    pub xray: bool,
+    /// Blur it (the xray buffers' own blur, or these options).
+    pub blur: Option<BlurOptions>,
+    pub noise: f32,
+    pub saturation: f32,
 }
 
 #[derive(Debug)]
@@ -46,6 +60,8 @@ struct Inner {
     framebuffer: Option<GlesTexture>,
     blur: Option<Blur>,
     intermediate: Option<GlesTexture>,
+    /// The framebuffer rectangle `intermediate` was copied from.
+    captured: Option<Rectangle<i32, Physical>>,
     /// Reusable storage for subregion-filtered damage rects.
     subregion_damage: Vec<Rectangle<i32, Physical>>,
 }
@@ -91,7 +107,15 @@ impl FramebufferEffect {
             noise,
             saturation,
             alpha: 1.,
+            mask: None,
         }
+    }
+
+    /// The effect's shape, to draw into a mask, standing for `info`.
+    pub fn render_mask(&self, params: RenderParams, info: MaskInfo) -> FramebufferEffectElement {
+        let mut elem = self.render(None, params, None, 0., 1.);
+        elem.mask = Some(info);
+        elem
     }
 }
 
@@ -100,6 +124,11 @@ impl FramebufferEffectElement {
     pub fn with_alpha(mut self, alpha: f32) -> Self {
         self.alpha = alpha.clamp(0., 1.);
         self
+    }
+
+    /// What this element stands for, if it is a wobbly window's mask.
+    pub fn mask_info(&self) -> Option<MaskInfo> {
+        self.mask
     }
 
     fn compute_uniforms(
@@ -156,7 +185,7 @@ impl Element for FramebufferEffectElement {
     }
 
     fn is_framebuffer_effect(&self) -> bool {
-        true
+        self.mask.is_none()
     }
 
     fn alpha(&self) -> f32 {
@@ -172,162 +201,10 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         dst: Rectangle<i32, Physical>,
         cache: &UserDataMap,
     ) -> Result<(), GlesError> {
-        let _span = tracy_client::span!("FramebufferEffectElement::capture_framebuffer");
-        let location = gpu_span_location!("FramebufferEffectElement::capture_framebuffer");
-        frame.with_gpu_span(location, |frame| {
-            let output_rect = Rectangle::from_size(frame.output_size());
-            let transform = frame.transformation();
-
-            let mut guard = frame.renderer();
-
-            let inner = cache
-                .get_or_insert::<RefCell<Inner>, _>(|| RefCell::new(Inner::new(guard.as_mut())));
-            let mut inner = inner.borrow_mut();
-            let inner = &mut *inner;
-
-            inner.intermediate = None;
-
-            // We want clamp-to-edge behavior for out-of-bounds pixels. However, glBlitFramebuffer
-            // seems to skip out-of-bounds pixels, even though my reading of the docs suggests
-            // otherwise (we use GL_LINEAR filter). So, clamp dst to the framebuffer bounds
-            // ourselves.
-            let clamped_dst = match dst.intersection(output_rect) {
-                Some(clamped) => clamped,
-                None => return Ok(()),
-            };
-            let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
-
-            let dst = transform.transform_rect_in(clamped_dst, &output_rect.size);
-
-            // Compute size from our geometry and scale.
-            //
-            // The "correct" size is always dst.size since that's the pixel region we're actually
-            // blitting. However, using dst.size causes two undesirable things when zooming out for
-            // the overview:
-            // 1. dst.size shrinks every frame, causing a texture realloaction for every fb effect
-            //    element every frame.
-            // 2. The underlying blur visually expands. This is technically correct, since the
-            //    underlying contents shrink, but it's not what you visually expect: you expect the
-            //    blur to also shrink as the windows zoom out, to give the zooming out effect.
-            //
-            // Using size computed from geometry and scale solves both of those problems (even
-            // though there's a bit of a cost in that zoomed-out elements still blur the entire
-            // unzoomed texture size, and even though the blur ends up slightly wrong as there's two
-            // layers of texture resampling, up and back down).
-            //
-            // Here we use src.size rather than geometry directly because src takes into account
-            // cropping.
-            let size = src
-                .size
-                .to_logical(1., Transform::Normal)
-                .upscale(clamp_scale)
-                .to_physical_precise_round(self.scale);
-            let size = transform.transform_size(size);
-
-            let size = size.to_logical(1).to_buffer(1, Transform::Normal);
-
-            // Recreate framebuffer if needed.
-            if inner
-                .framebuffer
-                .as_ref()
-                .is_some_and(|fb| fb.size() != size)
-            {
-                inner.framebuffer = None;
-            }
-            let framebuffer = if let Some(fb) = &inner.framebuffer {
-                fb
-            } else {
-                trace!("creating framebuffer texture sized {} × {}", size.w, size.h);
-                let renderer = guard.as_mut();
-                let texture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
-                inner.framebuffer.insert(texture)
-            };
-
-            // Prepare blur textures.
-            let mut blur = Option::zip(inner.blur.as_mut(), self.blur_options);
-            if let Some((b, options)) = &mut blur {
-                let renderer = guard.as_mut();
-                if let Err(err) = b.prepare_textures(
-                    |fourcc, size| renderer.create_buffer(fourcc, size),
-                    framebuffer,
-                    *options,
-                ) {
-                    warn!("error preparing blur textures: {err:?}");
-                    blur = None;
-                }
-            }
-
-            // We can't use renderer.with_context() as that will reset the GlesFrame binding that we
-            // want to blit from.
-            drop(guard);
-
-            // Blit the framebuffer contents.
-            frame.with_context(|gl| unsafe {
-                while gl.GetError() != ffi::NO_ERROR {}
-
-                let mut current_fbo = 0i32;
-                gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut current_fbo as *mut _);
-
-                // BlitFramebuffer is affected by the scissor test, we don't want that.
-                gl.Disable(ffi::SCISSOR_TEST);
-
-                let mut fbo = 0;
-                gl.GenFramebuffers(1, &mut fbo as *mut _);
-                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
-
-                gl.FramebufferTexture2D(
-                    ffi::DRAW_FRAMEBUFFER,
-                    ffi::COLOR_ATTACHMENT0,
-                    ffi::TEXTURE_2D,
-                    framebuffer.tex_id(),
-                    0,
-                );
-
-                gl.BlitFramebuffer(
-                    dst.loc.x,
-                    dst.loc.y,
-                    dst.loc.x + dst.size.w,
-                    dst.loc.y + dst.size.h,
-                    0,
-                    0,
-                    size.w,
-                    size.h,
-                    ffi::COLOR_BUFFER_BIT,
-                    ffi::LINEAR,
-                );
-
-                // Restore state set by GlesFrame that we just modified.
-                gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
-                gl.Enable(ffi::SCISSOR_TEST);
-
-                gl.DeleteFramebuffers(1, &mut fbo as *mut _);
-
-                if gl.GetError() != ffi::NO_ERROR {
-                    Err(GlesError::BlitError)
-                } else {
-                    Ok(())
-                }
-            })??;
-
-            // If blur is off, use the unblurred texture.
-            if self.blur_options.is_none() {
-                inner.intermediate = Some(framebuffer.clone());
-                return Ok(());
-            }
-
-            if let Some((blur, options)) = blur {
-                let mut guard = frame.renderer();
-                let renderer = guard.as_mut();
-                match blur.render(renderer, framebuffer, options) {
-                    Ok(blurred) => inner.intermediate = Some(blurred),
-                    Err(err) => {
-                        warn!("error rendering blur: {err:?}");
-                    }
-                }
-            }
-
-            Ok(())
-        })
+        if self.mask.is_some() {
+            return Ok(());
+        }
+        capture(frame, src, dst, cache, self.scale, self.blur_options)
     }
 
     fn draw(
@@ -339,17 +216,39 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         _opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let Some(cache) = cache else {
-            return Ok(());
-        };
-        let Some(inner) = cache.get::<RefCell<Inner>>() else {
-            return Ok(());
-        };
-        let mut inner = inner.borrow_mut();
-        let inner = &mut *inner;
+        let mut mask_damage = Vec::new();
+        let mut guard;
+        let (texture, filtered, tex_transform, uniform_transform) = if self.mask.is_some() {
+            let Some(white) = Shaders::get_from_frame(frame).white.clone() else {
+                return Ok(());
+            };
+            (
+                white,
+                &mut mask_damage,
+                Transform::Normal,
+                Transform::Normal,
+            )
+        } else {
+            let Some(cache) = cache else {
+                return Ok(());
+            };
+            let Some(inner) = cache.get::<RefCell<Inner>>() else {
+                return Ok(());
+            };
+            guard = inner.borrow_mut();
+            let inner = &mut *guard;
 
-        let Some(texture) = &inner.intermediate else {
-            return Ok(());
+            let Some(texture) = inner.intermediate.clone() else {
+                return Ok(());
+            };
+            // The intermediate texture has the same transform as the frame.
+            let transform = frame.transformation();
+            (
+                texture,
+                &mut inner.subregion_damage,
+                transform.invert(),
+                transform,
+            )
         };
 
         // Clamp the same way as in capture_framebuffer().
@@ -361,7 +260,6 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         let clamp_offset = clamped_dst.loc - dst.loc;
 
         // Filter damage by subregion, reusing the stored Vec to avoid allocation.
-        let filtered = &mut inner.subregion_damage;
         filtered.clear();
 
         if let Some(subregion) = &self.subregion {
@@ -403,17 +301,16 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         let program = Shaders::get_from_frame(frame).postprocess_and_clip.clone();
         let uniforms = program
             .is_some()
-            .then(|| self.compute_uniforms(crop, frame.transformation()));
+            .then(|| self.compute_uniforms(crop, uniform_transform));
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(
-            texture,
+            &texture,
             Rectangle::from_size(texture.size().to_f64()),
             clamped_dst,
             damage,
             &[],
-            // The intermediate texture has the same transform as the frame.
-            frame.transformation().invert(),
+            tex_transform,
             self.alpha,
             program.as_ref(),
             uniforms,
@@ -457,12 +354,193 @@ impl<'render> RenderElement<TtyRenderer<'render>> for FramebufferEffectElement {
     }
 }
 
+/// Copies the framebuffer under `dst` (blurred with `blur_options`) into `cache`.
+///
+/// `src` is the element's own size before cropping, in logical pixels at `scale`: the copy is
+/// that size, not `dst`'s, so a zoomed-out element still blurs as it would at full size.
+pub fn capture(
+    frame: &mut GlesFrame<'_, '_>,
+    src: Rectangle<f64, Buffer>,
+    dst: Rectangle<i32, Physical>,
+    cache: &UserDataMap,
+    scale: f32,
+    blur_options: Option<BlurOptions>,
+) -> Result<(), GlesError> {
+    let _span = tracy_client::span!("framebuffer_effect::capture");
+    let location = gpu_span_location!("FramebufferEffectElement::capture_framebuffer");
+    frame.with_gpu_span(location, |frame| {
+        let output_rect = Rectangle::from_size(frame.output_size());
+        let transform = frame.transformation();
+
+        let mut guard = frame.renderer();
+
+        let inner =
+            cache.get_or_insert::<RefCell<Inner>, _>(|| RefCell::new(Inner::new(guard.as_mut())));
+        let mut inner = inner.borrow_mut();
+        let inner = &mut *inner;
+
+        inner.intermediate = None;
+        inner.captured = None;
+
+        // We want clamp-to-edge behavior for out-of-bounds pixels. However, glBlitFramebuffer
+        // seems to skip out-of-bounds pixels, even though my reading of the docs suggests
+        // otherwise (we use GL_LINEAR filter). So, clamp dst to the framebuffer bounds
+        // ourselves.
+        let clamped_dst = match dst.intersection(output_rect) {
+            Some(clamped) => clamped,
+            None => return Ok(()),
+        };
+        let clamp_scale = clamped_dst.size.to_f64() / dst.size.to_f64();
+
+        let dst = transform.transform_rect_in(clamped_dst, &output_rect.size);
+        inner.captured = Some(dst);
+
+        // Compute size from our geometry and scale.
+        //
+        // The "correct" size is always dst.size since that's the pixel region we're actually
+        // blitting. However, using dst.size causes two undesirable things when zooming out for
+        // the overview:
+        // 1. dst.size shrinks every frame, causing a texture realloaction for every fb effect
+        //    element every frame.
+        // 2. The underlying blur visually expands. This is technically correct, since the
+        //    underlying contents shrink, but it's not what you visually expect: you expect the
+        //    blur to also shrink as the windows zoom out, to give the zooming out effect.
+        //
+        // Using size computed from geometry and scale solves both of those problems (even
+        // though there's a bit of a cost in that zoomed-out elements still blur the entire
+        // unzoomed texture size, and even though the blur ends up slightly wrong as there's two
+        // layers of texture resampling, up and back down).
+        //
+        // Here we use src.size rather than geometry directly because src takes into account
+        // cropping.
+        let size = src
+            .size
+            .to_logical(1., Transform::Normal)
+            .upscale(clamp_scale)
+            .to_physical_precise_round(scale);
+        let size = transform.transform_size(size);
+
+        let size = size.to_logical(1).to_buffer(1, Transform::Normal);
+
+        // Recreate framebuffer if needed.
+        if inner
+            .framebuffer
+            .as_ref()
+            .is_some_and(|fb| fb.size() != size)
+        {
+            inner.framebuffer = None;
+        }
+        let framebuffer = if let Some(fb) = &inner.framebuffer {
+            fb
+        } else {
+            trace!("creating framebuffer texture sized {} × {}", size.w, size.h);
+            let renderer = guard.as_mut();
+            let texture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
+            inner.framebuffer.insert(texture)
+        };
+
+        // Prepare blur textures.
+        let mut blur = Option::zip(inner.blur.as_mut(), blur_options);
+        if let Some((b, options)) = &mut blur {
+            let renderer = guard.as_mut();
+            if let Err(err) = b.prepare_textures(
+                |fourcc, size| renderer.create_buffer(fourcc, size),
+                framebuffer,
+                *options,
+            ) {
+                warn!("error preparing blur textures: {err:?}");
+                blur = None;
+            }
+        }
+
+        // We can't use renderer.with_context() as that will reset the GlesFrame binding that we
+        // want to blit from.
+        drop(guard);
+
+        // Blit the framebuffer contents.
+        frame.with_context(|gl| unsafe {
+            while gl.GetError() != ffi::NO_ERROR {}
+
+            let mut current_fbo = 0i32;
+            gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut current_fbo as *mut _);
+
+            // BlitFramebuffer is affected by the scissor test, we don't want that.
+            gl.Disable(ffi::SCISSOR_TEST);
+
+            let mut fbo = 0;
+            gl.GenFramebuffers(1, &mut fbo as *mut _);
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
+
+            gl.FramebufferTexture2D(
+                ffi::DRAW_FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                framebuffer.tex_id(),
+                0,
+            );
+
+            gl.BlitFramebuffer(
+                dst.loc.x,
+                dst.loc.y,
+                dst.loc.x + dst.size.w,
+                dst.loc.y + dst.size.h,
+                0,
+                0,
+                size.w,
+                size.h,
+                ffi::COLOR_BUFFER_BIT,
+                ffi::LINEAR,
+            );
+
+            // Restore state set by GlesFrame that we just modified.
+            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, current_fbo as u32);
+            gl.Enable(ffi::SCISSOR_TEST);
+
+            gl.DeleteFramebuffers(1, &mut fbo as *mut _);
+
+            if gl.GetError() != ffi::NO_ERROR {
+                Err(GlesError::BlitError)
+            } else {
+                Ok(())
+            }
+        })??;
+
+        // If blur is off, use the unblurred texture.
+        if blur_options.is_none() {
+            inner.intermediate = Some(framebuffer.clone());
+            return Ok(());
+        }
+
+        if let Some((blur, options)) = blur {
+            let mut guard = frame.renderer();
+            let renderer = guard.as_mut();
+            match blur.render(renderer, framebuffer, options) {
+                Ok(blurred) => inner.intermediate = Some(blurred),
+                Err(err) => {
+                    warn!("error rendering blur: {err:?}");
+                }
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// The copy [`capture`] left in `cache`, and the framebuffer rectangle it came from, in
+/// the framebuffer's own pixels (as `glBlitFramebuffer` and `gl_FragCoord` count them).
+pub fn captured(cache: &UserDataMap) -> Option<(GlesTexture, Rectangle<i32, Physical>)> {
+    let inner = cache.get::<RefCell<Inner>>()?;
+    let inner = inner.borrow();
+    Some((inner.intermediate.clone()?, inner.captured?))
+}
+
 impl Inner {
     fn new(renderer: &mut GlesRenderer) -> Self {
         Inner {
             framebuffer: None,
             blur: Blur::new(renderer),
             intermediate: None,
+            captured: None,
             subregion_damage: Vec::new(),
         }
     }

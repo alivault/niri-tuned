@@ -44,6 +44,12 @@ pub struct XrayPos {
     /// Draw non-xray background effects as xray too: the geometry is drawn offscreen (a
     /// wobbly window), where there is no framebuffer behind it to blur.
     pub prefer_xray: bool,
+
+    /// Draw background effects as their shape only (see [`MaskInfo`]): the geometry is drawn
+    /// offscreen into a wobbly window's mask, and the window draws the effect itself.
+    ///
+    /// [`MaskInfo`]: crate::render_helpers::framebuffer_effect::MaskInfo
+    pub mask: bool,
 }
 
 impl XrayPos {
@@ -52,11 +58,17 @@ impl XrayPos {
             pos_in_backdrop: pos_in_backdrop.downscale(zoom),
             zoom,
             prefer_xray: false,
+            mask: false,
         }
     }
 
     pub fn preferring_xray(mut self) -> Self {
         self.prefer_xray = true;
+        self
+    }
+
+    pub fn masking(mut self) -> Self {
+        self.mask = true;
         self
     }
 
@@ -72,6 +84,7 @@ impl Default for XrayPos {
             pos_in_backdrop: Point::new(0., 0.),
             zoom: 1.,
             prefer_xray: false,
+            mask: false,
         }
     }
 }
@@ -269,6 +282,57 @@ impl Xray {
             };
             push(elem);
         }
+    }
+}
+
+/// One xray buffer as a wobbly window's backdrop samples it, in screen space.
+#[derive(Debug, Clone)]
+pub struct XrayLayer {
+    pub buffer: Rc<RefCell<EffectBuffer>>,
+    /// Where the buffer is, in backdrop coordinates (zoomed, as `XrayPos` counts them).
+    pub rect: Rectangle<f64, Logical>,
+    /// Shown behind the buffer (premultiplied).
+    pub bg_color: Color32F,
+    /// Nothing outside `rect` (a workspace), rather than its edge stretched (the backdrop).
+    pub clip: bool,
+}
+
+impl Xray {
+    /// The buffers a wobbly window's xray backdrop shows, bottom first, ready to draw.
+    pub fn layers(
+        &self,
+        renderer: &mut GlesRenderer,
+        target: RenderTarget,
+        blur: bool,
+    ) -> Vec<XrayLayer> {
+        let mut layers = Vec::new();
+
+        let backdrop = &self.backdrop[target as usize];
+        let mut buffer = backdrop.borrow_mut();
+        if buffer.prepare(renderer, blur) {
+            layers.push(XrayLayer {
+                buffer: backdrop.clone(),
+                rect: Rectangle::from_size(buffer.logical_size()),
+                bg_color: self.backdrop_color,
+                clip: false,
+            });
+        }
+        drop(buffer);
+
+        let background = &self.background[target as usize];
+        let mut buffer = background.borrow_mut();
+        if buffer.prepare(renderer, blur) {
+            for (ws_geo, bg_color) in &self.workspaces {
+                layers.push(XrayLayer {
+                    buffer: background.clone(),
+                    rect: *ws_geo,
+                    bg_color: *bg_color,
+                    clip: true,
+                });
+            }
+        }
+
+        layers
     }
 }
 

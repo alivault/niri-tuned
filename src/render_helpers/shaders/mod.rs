@@ -1,15 +1,17 @@
 use std::cell::RefCell;
 
 use glam::Mat3;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform, UniformName, UniformType,
-    UniformValue,
+    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName,
+    UniformType, UniformValue,
 };
+use smithay::backend::renderer::ImportMem as _;
 
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderProgram;
 use crate::render_helpers::blur::BlurProgram;
-use crate::render_helpers::wobbly::WobblyProgram;
+use crate::render_helpers::wobbly::{WobblyBackdropProgram, WobblyProgram};
 
 pub struct Shaders {
     pub border: Option<ShaderProgram>,
@@ -22,6 +24,10 @@ pub struct Shaders {
     pub gradient_fade: Option<GlesTexProgram>,
     pub blur: Option<BlurProgram>,
     pub wobbly: Option<WobblyProgram>,
+    /// The blur behind a wobbly window, drawn through its mesh.
+    pub wobbly_backdrop: Option<WobblyBackdropProgram>,
+    /// One opaque white texel: the shape of a background effect, drawn as a mask.
+    pub white: Option<GlesTexture>,
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
@@ -202,8 +208,23 @@ impl Shaders {
             })
             .ok();
 
+        let wobbly_backdrop = WobblyBackdropProgram::compile(renderer)
+            .map_err(|err| {
+                warn!("error compiling wobbly backdrop shader: {err:?}");
+            })
+            .ok();
+
+        let white = renderer
+            .import_memory(&[255; 4], Fourcc::Abgr8888, (1, 1).into(), false)
+            .map_err(|err| {
+                warn!("error creating the white texture: {err:?}");
+            })
+            .ok();
+
         Self {
             wobbly,
+            wobbly_backdrop,
+            white,
             border,
             shadow,
             clipped_surface,

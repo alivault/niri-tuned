@@ -34,7 +34,7 @@ use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::wobbly::WobblyRenderElement;
+use crate::render_helpers::wobbly::{BackdropSource, WobblyBackdropElement, WobblyRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::transaction::Transaction;
@@ -169,6 +169,9 @@ pub struct Tile<W: LayoutElement> {
     /// The tile drawn offscreen, to bend.
     wobbly_offscreen: OffscreenBuffer,
     wobbly_id: Id,
+    /// The background effect's shape, drawn offscreen like the tile, to draw the effect through.
+    wobbly_mask_offscreen: OffscreenBuffer,
+    wobbly_backdrop_id: Id,
     wobbly_commit: Cell<CommitCounter>,
 
     /// Snapshot of the last render for use in the close animation.
@@ -207,6 +210,7 @@ niri_render_elements! {
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
         Wobbly = WobblyRenderElement,
+        WobblyBackdrop = WobblyBackdropElement,
     }
 }
 
@@ -246,6 +250,16 @@ pub(super) struct AlphaAnimation {
     /// completes.
     pub(super) hold_after_done: bool,
     offscreen: OffscreenBuffer,
+}
+
+/// What a wobbly tile needs to draw its background effect through its mesh.
+struct WobblyBackdrop<'a> {
+    /// The effect's shape (mask elements), drawn from the tile's origin.
+    masks: &'a [TileRenderElement<GlesRenderer>],
+    xray: Option<&'a Xray>,
+    target: RenderTarget,
+    /// The tile origin's.
+    xray_pos: XrayPos,
 }
 
 /// How much of a move animation (not a drag) wobbles a window.
@@ -299,6 +313,8 @@ impl<W: LayoutElement> Tile<W> {
             wobbly_offset: Point::from((0., 0.)),
             wobbly_offscreen: OffscreenBuffer::default(),
             wobbly_id: Id::new(),
+            wobbly_mask_offscreen: OffscreenBuffer::default(),
+            wobbly_backdrop_id: Id::new(),
             wobbly_commit: Cell::new(CommitCounter::default()),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
@@ -654,13 +670,21 @@ impl<W: LayoutElement> Tile<W> {
             && self.fullscreen_progress() == 0.
     }
 
+    /// The tile drawn from `elements` and bent; with `backdrop`, also the background effect
+    /// behind it, drawn through the same mesh from its shape (`masks`, drawn with
+    /// [`XrayPos::masking`] at the tile's `xray_pos`).
     fn render_wobbly(
         &self,
         renderer: &mut GlesRenderer,
         elements: &[TileRenderElement<GlesRenderer>],
         location: Point<f64, Logical>,
         alpha: f32,
-    ) -> Option<(WobblyRenderElement, OffscreenData)> {
+        backdrop: Option<WobblyBackdrop<'_>>,
+    ) -> Option<(
+        WobblyRenderElement,
+        Option<WobblyBackdropElement>,
+        OffscreenData,
+    )> {
         let model = self.wobbly.as_ref()?;
         if !WobblyRenderElement::has_shader(renderer) {
             return None;
@@ -690,7 +714,69 @@ impl<W: LayoutElement> Tile<W> {
             alpha,
         )?;
         data.id = elem.id().clone();
-        Some((elem, data))
+
+        let backdrop = backdrop.and_then(|backdrop| {
+            self.render_wobbly_backdrop(
+                renderer, backdrop, &picture, location, size, &points, alpha,
+            )
+        });
+
+        Some((elem, backdrop, data))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_wobbly_backdrop(
+        &self,
+        renderer: &mut GlesRenderer,
+        backdrop: WobblyBackdrop<'_>,
+        picture: &OffscreenRenderElement,
+        location: Point<f64, Logical>,
+        size: Size<f64, Logical>,
+        points: &[DVec2; 16],
+        alpha: f32,
+    ) -> Option<WobblyBackdropElement> {
+        // All of a tile's effects are one window's: the first says what they show.
+        let info = backdrop.masks.iter().find_map(|elem| match elem {
+            TileRenderElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(
+                elem,
+            )) => elem.mask_info(),
+            _ => None,
+        })?;
+
+        let source = if info.xray {
+            let xray = backdrop.xray?;
+            let blur = info.blur.is_some();
+            BackdropSource::Xray {
+                layers: xray.layers(renderer, backdrop.target, blur),
+                blur,
+            }
+        } else {
+            BackdropSource::Live(info.blur)
+        };
+
+        let scale = Scale::from(self.scale);
+        let (mask, _sync, _data) = self
+            .wobbly_mask_offscreen
+            .render(renderer, scale, backdrop.masks)
+            .map_err(|err| warn!("error rendering wobbly backdrop mask: {err:?}"))
+            .ok()?;
+
+        WobblyBackdropElement::new(
+            renderer,
+            self.wobbly_backdrop_id.clone(),
+            self.wobbly_commit.get(),
+            picture,
+            &mask,
+            scale,
+            location,
+            size,
+            points,
+            backdrop.xray_pos,
+            source,
+            info.noise,
+            info.saturation,
+            alpha,
+        )
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
@@ -1824,8 +1910,8 @@ impl<W: LayoutElement> Tile<W> {
             // A window that wobbles while it opens (moved as it opens) bends inside its open
             // animation.
             if wobbling {
-                if let Some((elem, _data)) =
-                    self.render_wobbly(ctx.renderer, &elements, Point::new(0., 0.), 1.)
+                if let Some((elem, _, _data)) =
+                    self.render_wobbly(ctx.renderer, &elements, Point::new(0., 0.), 1., None)
                 {
                     elements = vec![elem.into()];
                 }
@@ -1849,7 +1935,17 @@ impl<W: LayoutElement> Tile<W> {
             }
         } else if wobbling {
             // Bent, with the alpha animation's alpha if there is one (an interactive move).
+            //
+            // The background effect is not drawn offscreen with the tile (nothing is behind it
+            // there, and it would bend with it): only its shape is, as a mask, and the effect is
+            // drawn on screen through the bent mask, reading what is behind in screen space.
             let mut ctx = ctx.as_gles();
+            let through_mask = WobblyBackdropElement::has_shader(ctx.renderer);
+            let inner_xray_pos = if through_mask {
+                xray_pos.masking()
+            } else {
+                inner_xray_pos
+            };
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
@@ -1858,11 +1954,26 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
-            if let Some((elem, data)) =
-                self.render_wobbly(ctx.renderer, &elements, location, tile_alpha)
+            let mut masks = Vec::new();
+            if through_mask {
+                (masks, elements) = elements
+                    .into_iter()
+                    .partition(|elem| matches!(elem, TileRenderElement::BackgroundEffect(_)));
+            }
+            let backdrop = (!masks.is_empty()).then(|| WobblyBackdrop {
+                masks: &masks,
+                xray: ctx.xray,
+                target: ctx.target,
+                xray_pos,
+            });
+            if let Some((elem, backdrop, data)) =
+                self.render_wobbly(ctx.renderer, &elements, location, tile_alpha, backdrop)
             {
                 self.window().set_offscreen_data(Some(data));
                 push(elem.into());
+                if let Some(backdrop) = backdrop {
+                    push(backdrop.into());
+                }
                 pushed = true;
             }
         }
