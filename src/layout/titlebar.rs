@@ -8,7 +8,7 @@ use std::f64::consts::PI;
 use anyhow::ensure;
 use niri_config::{
     Color, CornerRadius, GradientInterpolation, TitlebarButton, TitlebarButtonHighlight,
-    TitlebarButtonsPosition, TitlebarCloseRed,
+    TitlebarButtonShape, TitlebarButtonsPosition, TitlebarCloseRed,
 };
 use pango::FontDescription;
 use pangocairo::cairo::{self, ImageSurface};
@@ -58,6 +58,8 @@ pub struct Titlebar {
     buffer: SolidColorBuffer,
     use_shader: bool,
     size: Size<f64, Logical>,
+    /// The bar's top corners, fitted to its size (the window's).
+    radius: CornerRadius,
     scale: f64,
     is_active: bool,
     hovered: Option<TitlebarPart>,
@@ -71,8 +73,85 @@ pub struct Titlebar {
 struct Textures {
     title_key: Option<TitleKey>,
     title: Option<TextureBuffer<GlesTexture>>,
-    /// By button, hovered, icon hovered (`button-hover-group`), active and toggled.
-    buttons: HashMap<(TitlebarButton, bool, bool, bool, bool), Option<TextureBuffer<GlesTexture>>>,
+    buttons: HashMap<ButtonKey, Option<TextureBuffer<GlesTexture>>>,
+}
+
+/// What a button's texture shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ButtonKey {
+    button: TitlebarButton,
+    hovered: bool,
+    /// The icon's hover state (`button-hover-group`: any button hovered).
+    icon_hovered: bool,
+    is_active: bool,
+    toggled: bool,
+    /// Full-height buttons only: the window's rounded top corners over the button.
+    clip: CornerClip,
+}
+
+/// The bar's rounded top corners as they reach into a button (full-height buttons): for each
+/// corner the button is near, the distance from the bar's side to the button's and the
+/// corner's radius, as f64 bits (hashable). `None`: the corner is clear of the button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct CornerClip {
+    left: Option<(u64, u64)>,
+    right: Option<(u64, u64)>,
+}
+
+impl CornerClip {
+    /// The clip of a button `rect` on a bar of `width` with top corners `radius`.
+    fn new(width: f64, radius: CornerRadius, rect: Rectangle<f64, Logical>) -> Self {
+        let corner = |distance: f64, radius: f32| {
+            let radius = f64::from(radius);
+            (radius > 0. && distance < radius).then(|| (distance.to_bits(), radius.to_bits()))
+        };
+        Self {
+            left: corner(rect.loc.x, radius.top_left),
+            right: corner(width - rect.loc.x - rect.size.w, radius.top_right),
+        }
+    }
+
+    /// The bar's shape in the button's coordinates (`w` × `h`, scaled by `scale`) as the
+    /// current path: the button's rectangle with the bar's top corners cut away.
+    fn path(self, cr: &cairo::Context, w: f64, h: f64, scale: f64) {
+        let get = |c: Option<(u64, u64)>| {
+            c.map_or((0., 0.), |(d, r)| {
+                (f64::from_bits(d) * scale, f64::from_bits(r) * scale)
+            })
+        };
+        let (dl, rl) = get(self.left);
+        let (dr, rr) = get(self.right);
+        // The bar's sides (outside the button when clear: no corner there).
+        let (x0, x1) = (-dl, w + dr);
+        cr.new_sub_path();
+        if rl > 0. {
+            cr.arc(x0 + rl, rl, rl, PI, 3. * PI / 2.);
+        } else {
+            cr.move_to(x0, 0.);
+        }
+        if rr > 0. {
+            cr.arc(x1 - rr, rr, rr, -PI / 2., 0.);
+        } else {
+            cr.line_to(x1, 0.);
+        }
+        cr.line_to(x1, h);
+        cr.line_to(x0, h);
+        cr.close_path();
+    }
+
+    /// Whether `point`, relative to the bar of `size`, is inside its rounded top corners.
+    fn bar_contains(
+        size: Size<f64, Logical>,
+        radius: CornerRadius,
+        point: Point<f64, Logical>,
+    ) -> bool {
+        let outside = |dx: f64, r: f32| {
+            let r = f64::from(r);
+            let (dx, dy) = (r - dx, r - point.y);
+            dx > 0. && dy > 0. && dx * dx + dy * dy > r * r
+        };
+        !outside(point.x, radius.top_left) && !outside(size.w - point.x, radius.top_right)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +178,7 @@ impl Titlebar {
             buffer: SolidColorBuffer::default(),
             use_shader: false,
             size: Size::default(),
+            radius: CornerRadius::default(),
             scale: 1.,
             is_active: false,
             hovered: None,
@@ -183,6 +263,7 @@ impl Titlebar {
         }
         .fit_to(size.w as f32, size.h as f32);
 
+        self.radius = radius;
         self.use_shader = radius != CornerRadius::default();
         self.buffer.update(size, color);
         self.background.update(
@@ -200,18 +281,33 @@ impl Titlebar {
         );
     }
 
-    /// The square slot of the `idx`th button from the bar's edge, relative to a bar of `size`.
+    fn full_height(&self) -> bool {
+        self.config.button_shape == TitlebarButtonShape::FullHeight
+    }
+
+    /// The slot of the `idx`th button from the bar's edge, relative to a bar of `size`: a
+    /// `button-size` square centred on the bar's height, or with full-height buttons
+    /// `button-size` wide and as tall as the bar.
     fn button_rect(&self, size: Size<f64, Logical>, idx: usize) -> Rectangle<f64, Logical> {
         let button = self.config.button_size;
+        let height = if self.full_height() { size.h } else { button };
         let offset = self.config.button_edge_gap + (button + self.config.button_gap) * idx as f64;
         let x = match self.config.buttons_position {
             TitlebarButtonsPosition::Left => offset,
             TitlebarButtonsPosition::Right => size.w - offset - button,
         };
-        let loc = Point::from((x, (size.h - button) / 2.))
+        let loc = Point::from((x, (size.h - height) / 2.))
             .to_physical_precise_round(self.scale)
             .to_logical(self.scale);
-        Rectangle::new(loc, Size::from((button, button)))
+        Rectangle::new(loc, Size::from((button, height)))
+    }
+
+    /// The window's rounded top corners over the `idx`th button (full-height buttons only).
+    fn button_clip(&self, size: Size<f64, Logical>, idx: usize) -> CornerClip {
+        if !self.full_height() {
+            return CornerClip::default();
+        }
+        CornerClip::new(size.w, self.radius, self.button_rect(size, idx))
     }
 
     /// The part of a bar of `size` under `point`, relative to the bar.
@@ -224,8 +320,10 @@ impl Titlebar {
             return None;
         }
 
+        // Outside the window's rounded corner is no button's (full-height buttons reach it).
+        let in_shape = !self.full_height() || CornerClip::bar_contains(size, self.radius, point);
         for (idx, button) in self.config.buttons.iter().enumerate() {
-            if self.button_rect(size, idx).contains(point) {
+            if in_shape && self.button_rect(size, idx).contains(point) {
                 return Some(TitlebarPart::Button(*button));
             }
         }
@@ -257,13 +355,20 @@ impl Titlebar {
                 let icon_hovered = hovered
                     || (self.config.button_hover_group
                         && matches!(self.hovered, Some(TitlebarPart::Button(_))));
-                let toggled = self.state.toggled(button);
-                let key = (button, hovered, icon_hovered, self.is_active, toggled);
+                let key = ButtonKey {
+                    button,
+                    hovered,
+                    icon_hovered,
+                    is_active: self.is_active,
+                    toggled: self.state.toggled(button),
+                    clip: self.button_clip(self.size, idx),
+                };
+                let rect_size = self.button_rect(self.size, idx).size;
                 let texture = textures
                     .buttons
                     .entry(key)
                     .or_insert_with(|| {
-                        render_button(gles, &self.config, key, scale)
+                        render_button(gles, &self.config, key, rect_size, scale)
                             .map_err(|err| warn!("error rendering title bar button: {err:?}"))
                             .ok()
                     })
@@ -412,31 +517,61 @@ fn render_title(
 fn render_button(
     renderer: &mut GlesRenderer,
     config: &niri_config::Titlebar,
-    (button, hovered, icon_hovered, is_active, toggled): (TitlebarButton, bool, bool, bool, bool),
+    key: ButtonKey,
+    size: Size<f64, Logical>,
     scale: f64,
 ) -> anyhow::Result<TextureBuffer<GlesTexture>> {
     let _span = tracy_client::span!("titlebar::render_button");
 
-    let px = (config.button_size * scale).round().max(1.) as i32;
-    let surface = ImageSurface::create(cairo::Format::ARgb32, px, px)?;
+    let surface = draw_button(config, key, size, scale)?;
+    upload(renderer, surface, scale)
+}
+
+/// A button's pixels in a slot of `size`: its shape (a rounded square centred in the slot,
+/// or the whole slot clipped to the window's corners) and its icon, centred.
+fn draw_button(
+    config: &niri_config::Titlebar,
+    ButtonKey {
+        button,
+        hovered,
+        icon_hovered,
+        is_active,
+        toggled,
+        clip,
+    }: ButtonKey,
+    size: Size<f64, Logical>,
+    scale: f64,
+) -> anyhow::Result<ImageSurface> {
+    let w = (size.w * scale).round().max(1.) as i32;
+    let h = (size.h * scale).round().max(1.) as i32;
+    let surface = ImageSurface::create(cairo::Format::ARgb32, w, h)?;
     let cr = cairo::Context::new(&surface)?;
-    let size = f64::from(px);
-    let c = size / 2.;
+    let (w, h) = (f64::from(w), f64::from(h));
+    let full_height = config.button_shape == TitlebarButtonShape::FullHeight;
+    let shape = |cr: &cairo::Context| {
+        if full_height {
+            clip.path(cr, w, h, scale);
+        } else {
+            let side = config.button_circle * scale;
+            button_shape(cr, w / 2., side, button_corner_radius(config) * scale);
+        }
+    };
 
     let colors = button_colors(config, button, hovered, icon_hovered, is_active);
     if let Some(fill) = colors.circle {
-        let side = config.button_circle * scale;
-        let radius = button_corner_radius(config) * scale;
         set_color(&cr, fill);
-        button_shape(&cr, c, side, radius);
+        shape(&cr);
         cr.fill()?;
         if colors.brighten {
             cr.set_source_rgba(1., 1., 1., config.button_hover_brighten);
-            button_shape(&cr, c, side, radius);
+            shape(&cr);
             cr.fill()?;
         }
     }
     let glyph_color = colors.icon;
+    // The icon centred on the slot (a square but for full-height buttons).
+    cr.translate((w - h) / 2., 0.);
+    let c = h / 2.;
 
     // The configured icon (a built-in Phosphor one by default), its view box fitted to the
     // icon side and centred in the slot.
@@ -449,8 +584,7 @@ fn render_button(
     });
     icon.draw(&cr, c, config.icon_size * scale, scale)?;
     drop(cr);
-
-    upload(renderer, surface, scale)
+    Ok(surface)
 }
 
 /// A button shape's corner radius: `button-radius`, at most half its side; unset, a circle.
@@ -498,11 +632,11 @@ fn button_colors(
     let is_close = button == TitlebarButton::Close;
     let red_plain = is_close
         && match config.close_red {
-            TitlebarCloseRed::Hover => false,
+            TitlebarCloseRed::Hover | TitlebarCloseRed::Never => false,
             TitlebarCloseRed::Focused => is_active,
             TitlebarCloseRed::Always => true,
         };
-    let red_hover = is_close;
+    let red_hover = is_close && config.close_red != TitlebarCloseRed::Never;
     let red = config.close_hover_color;
     let on_red = config.button_hover_text_color;
 
@@ -1062,6 +1196,174 @@ mod tests {
             };
             assert_eq!(bar.hit(size, gap), Some(TitlebarPart::Bar));
         }
+    }
+
+    fn full_height_bar(position: TitlebarButtonsPosition) -> Titlebar {
+        let mut bar = Titlebar::new(niri_config::Titlebar {
+            button_shape: TitlebarButtonShape::FullHeight,
+            // Opaque, so a pixel's alpha is its coverage.
+            button_color: Color::from_rgba8_unpremul(0x80, 0x80, 0x80, 0xff),
+            button_size: 46.,
+            button_edge_gap: 0.,
+            button_gap: 0.,
+            icon_size: 13.,
+            buttons_position: position,
+            buttons: vec![
+                TitlebarButton::Close,
+                TitlebarButton::Maximize,
+                TitlebarButton::Menu,
+            ],
+            ..Default::default()
+        });
+        bar.update_render_elements(
+            Size::from((300., 32.)),
+            true,
+            TitlebarState::default(),
+            "",
+            CornerRadius::from(15.),
+            1.,
+            1.,
+        );
+        bar
+    }
+
+    #[test]
+    fn full_height_buttons_fill_the_bar_edge_to_edge() {
+        let size = Size::from((300., 32.));
+        for position in [
+            TitlebarButtonsPosition::Left,
+            TitlebarButtonsPosition::Right,
+        ] {
+            let bar = full_height_bar(position);
+            let rects: Vec<_> = (0..3).map(|idx| bar.button_rect(size, idx)).collect();
+            for rect in &rects {
+                assert_eq!(rect.size, Size::from((46., 32.)));
+                assert_eq!(rect.loc.y, 0.);
+            }
+            let (xs, outer) = match position {
+                TitlebarButtonsPosition::Left => ([0., 46., 92.], rects[0].loc.x),
+                TitlebarButtonsPosition::Right => ([254., 208., 162.], 300. - rects[0].loc.x - 46.),
+            };
+            assert_eq!(rects.iter().map(|r| r.loc.x).collect::<Vec<_>>(), xs);
+            assert_eq!(outer, 0., "close touches the window's side");
+
+            // Only the corner button takes the window's corner, on its outer side.
+            let clip = |idx| bar.button_clip(size, idx);
+            let corner = Some((0f64.to_bits(), 15f64.to_bits()));
+            match position {
+                TitlebarButtonsPosition::Left => assert_eq!(clip(0).left, corner),
+                TitlebarButtonsPosition::Right => assert_eq!(clip(0).right, corner),
+            }
+            assert_eq!(
+                clip(0).left.is_some() as u8 + clip(0).right.is_some() as u8,
+                1
+            );
+            assert_eq!(clip(1), CornerClip::default());
+            assert_eq!(clip(2), CornerClip::default());
+        }
+        // Inset buttons are never clipped.
+        let mut bar = full_height_bar(TitlebarButtonsPosition::Left);
+        bar.config.button_shape = TitlebarButtonShape::Inset;
+        assert_eq!(bar.button_clip(size, 0), CornerClip::default());
+    }
+
+    #[test]
+    fn full_height_fill_stays_inside_the_window_corner() {
+        let alpha = |surface: &mut ImageSurface, x: i32, y: i32| {
+            let stride = surface.stride() as usize;
+            let data = surface.data().unwrap();
+            data[y as usize * stride + x as usize * 4 + 3]
+        };
+        for position in [
+            TitlebarButtonsPosition::Left,
+            TitlebarButtonsPosition::Right,
+        ] {
+            let bar = full_height_bar(position);
+            let size = bar.size;
+            let draw = |idx: usize, button| {
+                let key = ButtonKey {
+                    button,
+                    hovered: true,
+                    icon_hovered: true,
+                    is_active: true,
+                    toggled: false,
+                    clip: bar.button_clip(size, idx),
+                };
+                draw_button(&bar.config, key, bar.button_rect(size, idx).size, 1.).unwrap()
+            };
+            let mut close = draw(0, TitlebarButton::Close);
+            let (corner, inner) = match position {
+                TitlebarButtonsPosition::Left => (0, 45),
+                TitlebarButtonsPosition::Right => (45, 0),
+            };
+            // Every pixel of the window corner's square outside its 15 px arc is empty,
+            // every one well inside it full.
+            for y in 0..15 {
+                for x in 0..15 {
+                    let px = if corner == 0 { x } else { 45 - x };
+                    let (dx, dy) = (15. - (x as f64 + 0.5), 15. - (y as f64 + 0.5));
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d > 15.75 {
+                        assert_eq!(alpha(&mut close, px, y), 0, "{position:?} ({px}, {y})");
+                    } else if d < 14.25 {
+                        assert_eq!(alpha(&mut close, px, y), 255, "{position:?} ({px}, {y})");
+                    }
+                }
+            }
+            // The other corners are square.
+            assert_eq!(alpha(&mut close, inner, 0), 255);
+            assert_eq!(alpha(&mut close, corner, 31), 255);
+            assert_eq!(alpha(&mut close, inner, 31), 255);
+            // The next button fills its whole rectangle.
+            let mut maximize = draw(1, TitlebarButton::Maximize);
+            for (x, y) in [(0, 0), (45, 0), (0, 31), (45, 31)] {
+                assert_eq!(alpha(&mut maximize, x, y), 255);
+            }
+        }
+    }
+
+    #[test]
+    fn full_height_hit_leaves_out_the_window_corner() {
+        let size = Size::from((300., 32.));
+        let close = Some(TitlebarPart::Button(TitlebarButton::Close));
+        let bar = full_height_bar(TitlebarButtonsPosition::Left);
+        assert_eq!(
+            bar.hit(size, Point::from((1., 1.))),
+            Some(TitlebarPart::Bar)
+        );
+        assert_eq!(bar.hit(size, Point::from((8., 8.))), close);
+        assert_eq!(bar.hit(size, Point::from((0.5, 31.))), close);
+        assert_eq!(bar.hit(size, Point::from((45.5, 0.5))), close);
+        assert_eq!(
+            bar.hit(size, Point::from((46.5, 0.5))),
+            Some(TitlebarPart::Button(TitlebarButton::Maximize))
+        );
+        let bar = full_height_bar(TitlebarButtonsPosition::Right);
+        assert_eq!(
+            bar.hit(size, Point::from((299., 1.))),
+            Some(TitlebarPart::Bar)
+        );
+        assert_eq!(bar.hit(size, Point::from((292., 8.))), close);
+        assert_eq!(bar.hit(size, Point::from((254.5, 0.5))), close);
+    }
+
+    #[test]
+    fn close_red_never_is_grey() {
+        let mut config = niri_config::Titlebar {
+            button_highlight: TitlebarButtonHighlight::Hover,
+            ..Default::default()
+        };
+        let close = |config: &niri_config::Titlebar| {
+            button_colors(config, TitlebarButton::Close, true, true, true)
+        };
+        let menu = button_colors(&config, TitlebarButton::Menu, true, true, true);
+        assert_eq!(close(&config).circle, Some(config.close_hover_color));
+        config.close_red = TitlebarCloseRed::Never;
+        assert_eq!(close(&config), menu);
+        assert_eq!(
+            button_colors(&config, TitlebarButton::Close, false, false, true).circle,
+            None
+        );
     }
 
     #[test]

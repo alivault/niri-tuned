@@ -1590,7 +1590,10 @@ pub struct Titlebar {
     /// When the close button's circle is red: on hover (the default), on the focused window,
     /// or always.
     pub close_red: TitlebarCloseRed,
-    /// Side of each button's square slot, centred on the bar's height.
+    /// Each button's shape: inset in its slot (the default), or the whole slot.
+    pub button_shape: TitlebarButtonShape,
+    /// Side of each button's square slot, centred on the bar's height; with `button-shape
+    /// "full-height"`, the slot's width (it is as tall as the bar).
     pub button_size: f64,
     /// Side of a button's shape (a circle's diameter).
     pub button_circle: f64,
@@ -1652,6 +1655,7 @@ impl Default for Titlebar {
             button_hover_text_color: Color::from_rgba8_unpremul(0xff, 0xff, 0xff, 0xff),
             button_highlight: TitlebarButtonHighlight::Always,
             close_red: TitlebarCloseRed::Hover,
+            button_shape: TitlebarButtonShape::Inset,
             button_size: 30.,
             button_circle: 22.,
             button_radius: None,
@@ -1830,6 +1834,18 @@ pub enum TitlebarCloseRed {
     Hover,
     Focused,
     Always,
+    /// Never red: close's colours are the other buttons'.
+    Never,
+}
+
+/// A title bar button's shape.
+#[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq)]
+pub enum TitlebarButtonShape {
+    /// A circle or rounded square (`button-circle`, `button-radius`) centred in its slot.
+    Inset,
+    /// The whole slot, `button-size` wide and as tall as the bar, clipped to the window's
+    /// rounded top corners (so the corner button takes the window's corner).
+    FullHeight,
 }
 
 #[derive(knuffel::DecodeScalar, Debug, Clone, Copy, PartialEq)]
@@ -1884,6 +1900,8 @@ pub struct TitlebarRule {
     pub button_highlight: Option<TitlebarButtonHighlight>,
     #[knuffel(child, unwrap(argument))]
     pub close_red: Option<TitlebarCloseRed>,
+    #[knuffel(child, unwrap(argument))]
+    pub button_shape: Option<TitlebarButtonShape>,
     #[knuffel(child, unwrap(argument))]
     pub button_size: Option<FloatOrInt<1, 256>>,
     #[knuffel(child, unwrap(argument))]
@@ -1962,6 +1980,7 @@ impl MergeWith<TitlebarRule> for Titlebar {
             button_hover_text_color,
             button_highlight,
             close_red,
+            button_shape,
             buttons_position,
             buttons,
             menu_command,
@@ -2006,6 +2025,7 @@ impl MergeWith<Self> for TitlebarRule {
             button_hover_text_color,
             button_highlight,
             close_red,
+            button_shape,
             button_size,
             button_circle,
             button_radius,

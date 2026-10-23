@@ -725,6 +725,34 @@ mod tests {
     }
 
     #[test]
+    fn titlebar_button_shape_and_close_red_never_parse_and_layer() {
+        let config = do_parse("layout {\n titlebar {\n button-size 26\n }\n}");
+        assert_eq!(
+            config.layout.titlebar.button_shape,
+            TitlebarButtonShape::Inset
+        );
+        let config = do_parse(
+            "layout {\n titlebar {\n button-shape \"full-height\"\n close-red \"never\"\n }\n}",
+        );
+        assert_eq!(
+            config.layout.titlebar.button_shape,
+            TitlebarButtonShape::FullHeight
+        );
+        assert_eq!(config.layout.titlebar.close_red, TitlebarCloseRed::Never);
+        let config = parse_layered(
+            "layout {\n titlebar {\n button-shape \"full-height\"\n }\n}",
+            "window-rule {\n titlebar {\n button-shape \"inset\"\n }\n}",
+        );
+        assert_eq!(
+            config.layout.titlebar.button_shape,
+            TitlebarButtonShape::FullHeight
+        );
+        let mut bar = config.layout.titlebar.clone();
+        bar.merge_with(&config.window_rules[0].titlebar);
+        assert_eq!(bar.button_shape, TitlebarButtonShape::Inset);
+    }
+
+    #[test]
     fn blur_radius_parses_and_the_strength_set_last_wins() {
         let config = do_parse("blur { noise 0.05; }");
         assert_eq!(config.blur.radius, None);
@@ -1862,6 +1890,7 @@ mod tests {
                     },
                     button_highlight: Always,
                     close_red: Hover,
+                    button_shape: Inset,
                     button_size: 30.0,
                     button_circle: 22.0,
                     button_radius: None,
@@ -2458,6 +2487,7 @@ mod tests {
                         button_hover_text_color: None,
                         button_highlight: None,
                         close_red: None,
+                        button_shape: None,
                         button_size: None,
                         button_circle: None,
                         button_radius: None,
