@@ -11,7 +11,7 @@ use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{Frame as _, FrameContext, Offscreen, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
@@ -123,6 +123,22 @@ impl FramebufferEffectElement {
     /// Fade the effect over the actual framebuffer rather than a transparent offscreen.
     pub fn with_alpha(mut self, alpha: f32) -> Self {
         self.alpha = alpha.clamp(0., 1.);
+        self
+    }
+
+    /// The same effect, faded further by `alpha` (an alpha animation of the tile it is under).
+    pub fn faded(mut self, alpha: f32) -> Self {
+        self.alpha = (self.alpha * alpha).clamp(0., 1.);
+        self
+    }
+
+    /// The same effect, moved by `offset`: made at one place and drawn at another.
+    pub fn translated(mut self, offset: Point<f64, Logical>) -> Self {
+        self.geometry.loc += offset;
+        self.clip_geo.loc += offset;
+        if let Some(subregion) = &mut self.subregion {
+            subregion.offset += offset;
+        }
         self
     }
 
@@ -543,5 +559,54 @@ impl Inner {
             captured: None,
             subregion_damage: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn params() -> RenderParams {
+        RenderParams {
+            geometry: Rectangle::new(Point::new(10., 20.), (100., 50.).into()),
+            subregion: Some(TransformedRegion {
+                rects: Arc::new(vec![Rectangle::new((0, 0).into(), (5, 5).into())]),
+                scale: Scale::from(1.),
+                offset: Point::new(10., 20.),
+            }),
+            clip: Some((
+                Rectangle::new(Point::new(12., 22.), (90., 40.).into()),
+                CornerRadius::default(),
+            )),
+            scale: 2.,
+        }
+    }
+
+    #[test]
+    fn translated_moves_geometry_clip_and_subregion() {
+        let elem = FramebufferEffect::new()
+            .render(None, params(), None, 0., 1.)
+            .translated(Point::new(300., 400.));
+        assert_eq!(elem.geometry.loc, Point::new(310., 420.));
+        assert_eq!(elem.geometry.size, (100., 50.).into());
+        assert_eq!(elem.clip_geo.loc, Point::new(312., 422.));
+        assert_eq!(elem.clip_geo.size, (90., 40.).into());
+        assert_eq!(
+            elem.subregion.as_ref().unwrap().offset,
+            Point::new(310., 420.)
+        );
+        assert!(elem.is_framebuffer_effect());
+    }
+
+    #[test]
+    fn faded_multiplies_alpha() {
+        let elem = FramebufferEffect::new()
+            .render(None, params(), None, 0., 1.)
+            .with_alpha(0.5)
+            .faded(0.75);
+        assert_eq!(Element::alpha(&elem), 0.375);
+        assert_eq!(Element::alpha(&elem.faded(4.)), 1.);
     }
 }

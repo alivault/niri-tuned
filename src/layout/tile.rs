@@ -28,6 +28,7 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
+use crate::render_helpers::framebuffer_effect::FramebufferEffectElement;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
@@ -271,6 +272,27 @@ const WOBBLY_MOVE_GAIN: f64 = 0.35;
 /// is 128.5) would round the window up and push the tile past its column's height.
 fn titlebar_height_in_physical(scale: f64, height: f64) -> f64 {
     round_logical_in_physical(scale, height.round())
+}
+
+/// The live background effects in `elements` (framebuffer effects, not a wobbly window's masks),
+/// and the other elements, in their order.
+fn take_live_effects(
+    elements: Vec<TileRenderElement<GlesRenderer>>,
+) -> (
+    Vec<FramebufferEffectElement>,
+    Vec<TileRenderElement<GlesRenderer>>,
+) {
+    let mut effects = Vec::new();
+    let mut rest = Vec::with_capacity(elements.len());
+    for elem in elements {
+        match elem {
+            TileRenderElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(
+                effect,
+            )) if effect.mask_info().is_none() => effects.push(effect),
+            elem => rest.push(elem),
+        }
+    }
+    (effects, rest)
 }
 
 impl<W: LayoutElement> Tile<W> {
@@ -1988,6 +2010,11 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
+            // A live (non-xray) background effect reads what is below it in the framebuffer it
+            // is drawn to; in the offscreen nothing is, and the window shows clear (a tile held
+            // in an interactive move, at INTERACTIVE_MOVE_ALPHA). So it is drawn on screen,
+            // under the offscreen, at the tile's place.
+            let (effects, elements) = take_live_effects(elements);
             match alpha.offscreen.render(ctx.renderer, scale, &elements) {
                 Ok((elem, _sync, data)) => {
                     let offset = elem.offset();
@@ -1995,6 +2022,10 @@ impl<W: LayoutElement> Tile<W> {
 
                     self.window().set_offscreen_data(Some(data));
                     push(elem.into());
+                    for effect in effects {
+                        let effect = effect.translated(location).faded(tile_alpha);
+                        push(TileRenderElement::BackgroundEffect(effect.into()));
+                    }
                     pushed = true;
                 }
                 Err(err) => {
@@ -2171,5 +2202,47 @@ impl<W: LayoutElement> Tile<W> {
         let rounded = size.to_physical_precise_round(scale).to_logical(scale);
         assert_abs_diff_eq!(size.w, rounded.w, epsilon = 1e-5);
         assert_abs_diff_eq!(size.h, rounded.h, epsilon = 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::framebuffer_effect::{FramebufferEffect, MaskInfo};
+
+    #[test]
+    fn take_live_effects_keeps_masks_and_other_elements() {
+        let params = || RenderParams {
+            geometry: Rectangle::new(Point::new(0., 0.), (100., 50.).into()),
+            subregion: None,
+            clip: None,
+            scale: 1.,
+        };
+        let effect = FramebufferEffect::new();
+        let live = effect.render(None, params(), None, 0., 1.);
+        let mask = effect.render_mask(
+            params(),
+            MaskInfo {
+                xray: false,
+                blur: None,
+                noise: 0.,
+                saturation: 1.,
+            },
+        );
+        let elements: Vec<TileRenderElement<GlesRenderer>> = vec![
+            TileRenderElement::BackgroundEffect(mask.into()),
+            TileRenderElement::BackgroundEffect(live.into()),
+        ];
+
+        let (effects, rest) = take_live_effects(elements);
+        assert_eq!(effects.len(), 1);
+        assert!(effects[0].mask_info().is_none());
+        assert_eq!(rest.len(), 1);
+        assert!(matches!(
+            &rest[0],
+            TileRenderElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(e))
+                if e.mask_info().is_some()
+        ));
     }
 }
