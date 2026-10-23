@@ -285,12 +285,16 @@ impl Titlebar {
         self.config.button_shape == TitlebarButtonShape::FullHeight
     }
 
-    /// The slot of the `idx`th button from the bar's edge, relative to a bar of `size`: a
-    /// `button-size` square centred on the bar's height, or with full-height buttons
-    /// `button-size` wide and as tall as the bar.
+    /// The slot of the `idx`th button from the bar's edge, relative to a bar of `size`:
+    /// `button-size` wide, centred on the bar's height and as tall as it is wide or as the
+    /// shape (`button-height`), at most the bar; with full-height buttons as tall as the bar.
     fn button_rect(&self, size: Size<f64, Logical>, idx: usize) -> Rectangle<f64, Logical> {
         let button = self.config.button_size;
-        let height = if self.full_height() { size.h } else { button };
+        let height = if self.full_height() {
+            size.h
+        } else {
+            button.max(button_shape_height(&self.config)).min(size.h)
+        };
         let offset = self.config.button_edge_gap + (button + self.config.button_gap) * idx as f64;
         let x = match self.config.buttons_position {
             TitlebarButtonsPosition::Left => offset,
@@ -552,8 +556,8 @@ fn draw_button(
         if full_height {
             clip.path(cr, w, h, scale);
         } else {
-            let side = config.button_circle * scale;
-            button_shape(cr, w / 2., side, button_corner_radius(config) * scale);
+            let (bw, bh) = (config.button_circle * scale, button_shape_height(config) * scale);
+            button_shape(cr, w / 2., h / 2., bw, bh, button_corner_radius(config) * scale);
         }
     };
 
@@ -587,18 +591,24 @@ fn draw_button(
     Ok(surface)
 }
 
-/// A button shape's corner radius: `button-radius`, at most half its side; unset, a circle.
+/// A button shape's height: `button-height`, else `button-circle` (a square).
+fn button_shape_height(config: &niri_config::Titlebar) -> f64 {
+    config.button_height.unwrap_or(config.button_circle).max(0.)
+}
+
+/// A button shape's corner radius: `button-radius`, at most half its shorter side; unset, a
+/// circle (or a pill).
 fn button_corner_radius(config: &niri_config::Titlebar) -> f64 {
-    let half = config.button_circle.max(0.) / 2.;
+    let half = config.button_circle.min(button_shape_height(config)).max(0.) / 2.;
     config.button_radius.map_or(half, |r| r.clamp(0., half))
 }
 
-/// A button's shape as the current path: a `side` square centred on (`c`, `c`), its corners
-/// rounded at `radius` (a circle at half the side).
-fn button_shape(cr: &cairo::Context, c: f64, side: f64, radius: f64) {
-    let half = side / 2.;
-    let r = radius.clamp(0., half);
-    let (x0, y0, x1, y1) = (c - half, c - half, c + half, c + half);
+/// A button's shape as the current path: a `width` by `height` rectangle centred on (`cx`,
+/// `cy`), its corners rounded at `radius` (at most half the shorter side).
+fn button_shape(cr: &cairo::Context, cx: f64, cy: f64, width: f64, height: f64, radius: f64) {
+    let (hw, hh) = (width / 2., height / 2.);
+    let r = radius.clamp(0., hw.min(hh));
+    let (x0, y0, x1, y1) = (cx - hw, cy - hh, cx + hw, cy + hh);
     cr.new_sub_path();
     cr.arc(x1 - r, y0 + r, r, -PI / 2., 0.);
     cr.arc(x1 - r, y1 - r, r, 0., PI / 2.);
@@ -1116,7 +1126,7 @@ mod tests {
             let mut surface = ImageSurface::create(cairo::Format::ARgb32, 30, 30).unwrap();
             let cr = cairo::Context::new(&surface).unwrap();
             cr.set_source_rgba(1., 1., 1., 1.);
-            button_shape(&cr, 15., 20., radius);
+            button_shape(&cr, 15., 15., 20., 20., radius);
             cr.fill().unwrap();
             drop(cr);
             let stride = surface.stride() as usize;
@@ -1196,6 +1206,40 @@ mod tests {
             };
             assert_eq!(bar.hit(size, gap), Some(TitlebarPart::Bar));
         }
+    }
+
+    #[test]
+    fn button_height_makes_a_rectangle_and_the_slot_holds_it() {
+        let config = niri_config::Titlebar {
+            button_size: 30.,
+            button_circle: 26.,
+            button_height: Some(18.),
+            ..Default::default()
+        };
+        // A pill unless rounded less: half the shorter side.
+        assert_eq!(button_corner_radius(&config), 9.);
+        let bar = Titlebar::new(niri_config::Titlebar {
+            button_height: Some(34.),
+            ..config.clone()
+        });
+        // Taller than wide: the slot as tall as the shape, at most the bar.
+        assert_eq!(bar.button_rect(Size::from((300., 40.)), 0).size, Size::from((30., 34.)));
+        assert_eq!(bar.button_rect(Size::from((300., 32.)), 0).size, Size::from((30., 32.)));
+        let bar = Titlebar::new(config);
+        assert_eq!(bar.button_rect(Size::from((300., 40.)), 0).size, Size::from((30., 30.)));
+
+        // A 26 x 18 shape centred on a 30 px slot, square cornered.
+        let mut surface = ImageSurface::create(cairo::Format::ARgb32, 30, 30).unwrap();
+        let cr = cairo::Context::new(&surface).unwrap();
+        cr.set_source_rgba(1., 1., 1., 1.);
+        button_shape(&cr, 15., 15., 26., 18., 0.);
+        cr.fill().unwrap();
+        drop(cr);
+        let stride = surface.stride() as usize;
+        let data = surface.data().unwrap();
+        let alpha = |x: usize, y: usize| data[y * stride + x * 4 + 3];
+        assert_eq!((alpha(2, 6), alpha(27, 23)), (255, 255));
+        assert_eq!((alpha(1, 15), alpha(15, 5), alpha(15, 24)), (0, 0, 0));
     }
 
     fn full_height_bar(position: TitlebarButtonsPosition) -> Titlebar {

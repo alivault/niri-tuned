@@ -1597,8 +1597,11 @@ pub struct Titlebar {
     pub button_size: f64,
     /// Side of a button's shape (a circle's diameter).
     pub button_circle: f64,
-    /// Corner radius of a button's shape, at most half its side; unset: a circle.
+    /// Corner radius of a button's shape, at most half its shorter side; unset: a circle.
     pub button_radius: Option<f64>,
+    /// Height of a button's shape, `button-circle` its width; unset: a square. The slot grows
+    /// to hold it, up to the bar's height.
+    pub button_height: Option<f64>,
     /// Side of a button's icon (its whole view box).
     pub icon_size: f64,
     /// Gap between the outermost button and the bar's edge.
@@ -1659,6 +1662,7 @@ impl Default for Titlebar {
             button_size: 30.,
             button_circle: 22.,
             button_radius: None,
+            button_height: None,
             icon_size: 15.,
             button_edge_gap: 4.,
             button_gap: 0.,
@@ -1909,6 +1913,8 @@ pub struct TitlebarRule {
     #[knuffel(child, unwrap(argument))]
     pub button_radius: Option<FloatOrInt<0, 256>>,
     #[knuffel(child, unwrap(argument))]
+    pub button_height: Option<FloatOrInt<0, 256>>,
+    #[knuffel(child, unwrap(argument))]
     pub icon_size: Option<FloatOrInt<1, 256>>,
     #[knuffel(child, unwrap(argument))]
     pub button_edge_gap: Option<FloatOrInt<0, 256>>,
@@ -1954,6 +1960,9 @@ impl MergeWith<TitlebarRule> for Titlebar {
         }
         if let Some(x) = part.button_radius {
             self.button_radius = Some(x.0);
+        }
+        if let Some(x) = part.button_height {
+            self.button_height = Some(x.0);
         }
         merge!(
             (self, part),
@@ -2029,6 +2038,7 @@ impl MergeWith<Self> for TitlebarRule {
             button_size,
             button_circle,
             button_radius,
+            button_height,
             icon_size,
             button_edge_gap,
             button_gap,

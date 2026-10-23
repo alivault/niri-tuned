@@ -725,6 +725,20 @@ mod tests {
     }
 
     #[test]
+    fn titlebar_button_height_parses_and_layers() {
+        let config = do_parse("layout {\n titlebar {\n button-circle 18\n }\n}");
+        assert_eq!(config.layout.titlebar.button_height, None);
+        let config = parse_layered(
+            "layout {\n titlebar {\n button-height 9\n }\n}",
+            "window-rule {\n titlebar {\n button-height 14.5\n }\n}",
+        );
+        assert_eq!(config.layout.titlebar.button_height, Some(9.));
+        let mut bar = config.layout.titlebar.clone();
+        bar.merge_with(&config.window_rules[0].titlebar);
+        assert_eq!(bar.button_height, Some(14.5));
+    }
+
+    #[test]
     fn titlebar_button_shape_and_close_red_never_parse_and_layer() {
         let config = do_parse("layout {\n titlebar {\n button-size 26\n }\n}");
         assert_eq!(
@@ -1894,6 +1908,7 @@ mod tests {
                     button_size: 30.0,
                     button_circle: 22.0,
                     button_radius: None,
+                    button_height: None,
                     icon_size: 15.0,
                     button_edge_gap: 4.0,
                     button_gap: 0.0,
@@ -2491,6 +2506,7 @@ mod tests {
                         button_size: None,
                         button_circle: None,
                         button_radius: None,
+                        button_height: None,
                         icon_size: None,
                         button_edge_gap: None,
                         button_gap: None,
